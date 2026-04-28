@@ -18,14 +18,14 @@ vs.add_documents(chunks)
 retriever = Retriever()
 
 queries = [
-    # ✅ Valid queries
+    # Valid queries
     "What is phishing?",
     "How do phishing attacks work?",
     "What do cybercriminals use phishing for?",
     "What solutions are suggested to prevent phishing?",
     "What is the impact of phishing attacks?",
 
-    # ❌ Invalid queries
+    # Invalid queries
     "Who is the president of India?",
     "What is machine learning?",
     "Explain quantum physics"

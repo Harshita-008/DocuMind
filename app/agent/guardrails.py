@@ -65,7 +65,8 @@ def filter_relevant_chunks(results, query=None, max_chunks=None):
         filtered.append(item)
 
     if not query:
-        return _sort_chunks(filtered)[:max_chunks] if max_chunks else _sort_chunks(filtered)
+        sorted_chunks = _sort_chunks(filtered)
+        return sorted_chunks[:max_chunks] if max_chunks else sorted_chunks
 
     scored = []
     for chunk in filtered:
@@ -85,7 +86,6 @@ def filter_relevant_chunks(results, query=None, max_chunks=None):
     limit = min(max_chunks, query_limit) if max_chunks else query_limit
     selected = scored[:limit]
 
-    # Keep final context in PDF order so list and section answers retain flow.
     return sorted(selected, key=lambda c: (c.get("page", 0), c.get("chunk_index", 0)))
 
 
@@ -210,8 +210,7 @@ def _context_limit_for_query(query):
 
 
 def _query_terms(query):
-    terms = _topic_terms(query)
-    return list(dict.fromkeys(terms))
+    return list(dict.fromkeys(_topic_terms(query)))
 
 
 def _is_section_question(query):
@@ -252,14 +251,6 @@ def _is_definition_question(query):
 
 def _is_when_question(query):
     return bool(re.search(r"^\s*(?:when|what\s+year|what\s+date)\b", query.lower()))
-
-
-def _is_describe_question(query):
-    return bool(re.search(
-        r"\b(?:describe|tell|explain|how\s+(?:to|does|did|is|are)|"
-        r"what\s+is\s+the\s+(?:process|method|way|procedure))\b",
-        query.lower(),
-    ))
 
 
 def _is_framework_process_question(query):
@@ -336,17 +327,6 @@ def _normalize_question(query):
     query = re.sub(r"\bin\s+simple\s+words\b", "", query)
     query = re.sub(r"\s+", " ", query)
     return query.strip()
-
-
-def _matches_topic(text, terms):
-    text_lower = text.lower()
-    matches = _count_term_hits(terms, text_lower)
-    required = 1 if len(terms) <= 2 else max(2, len(terms) // 2)
-    return matches >= required
-
-
-def _matches_topic_lenient(text, terms):
-    return _count_term_hits(terms, text.lower()) >= 1
 
 
 def _count_term_hits(terms, text_lower):
@@ -452,16 +432,7 @@ def _term_variants(term):
         variants.add("importance")
     if term == "importance":
         variants.add("important")
-    if term in {"phishing", "phished"}:
-        variants.update({"phish", "phished", "phishing"})
-    if term in {"solution", "solutions"}:
-        variants.update({"countermeasure", "countermeasures", "safeguard", "safeguards", "protection", "protect", "preventive"})
-    if term in {"prevent", "prevents", "prevention"}:
-        variants.update({"protect", "protects", "protection", "thwart", "thwarts", "mitigate", "mitigates", "avoid", "avoidance", "stop", "stopping", "countermeasure", "safeguard"})
-    if term in {"impact", "impacts"}:
-        variants.update({"effect", "effects", "threat", "threats", "risk", "risks", "vulnerability", "vulnerabilities", "consequence", "consequences", "victimization"})
 
-    # Generic nation/adjective rule: words ending in "an" -> strip it, others -> append "an"
     if term.endswith("an") and len(term) > 4:
         variants.add(term[:-2])
     elif len(term) > 4 and not term.endswith("an"):

@@ -326,10 +326,6 @@ def _academic_paper_answer(context, question):
     query = question.lower()
     sentences = _clean_evidence_sentences(context)
 
-    security = _security_threat_answer(context, question)
-    if security:
-        return security
-
     if re.search(r"\b(dataset|data set)\b", query):
         return _dataset_answer(context)
 
@@ -357,81 +353,6 @@ def _academic_paper_answer(context, question):
 
     if _content_terms(query) and any(term in query for term in ["challenge", "problem", "issue"]):
         return _challenge_answer(context)
-
-    return None
-
-
-def _security_threat_answer(context, question):
-    query = question.lower()
-    text = re.sub(r"\s+", " ", context or "")
-    lower = text.lower()
-    if "phishing" not in lower and "phished" not in lower:
-        return None
-
-    if re.search(r"^\s*what\s+is\s+phishing\b", query):
-        points = []
-        if re.search(r"attaining personal information|personal information.*fraudulent use", text, flags=re.IGNORECASE):
-            return "Phishing is an IT threat where attackers try to obtain users' personal or sensitive information for fraudulent use."
-        if re.search(r"financial details|cybercriminal", text, flags=re.IGNORECASE):
-            points.append("It can involve tricking users into giving financial or personal details to cybercriminals.")
-        if re.search(r"mobile device users|information security threats", text, flags=re.IGNORECASE):
-            points.append("In this document, phishing is treated as an information-security threat affecting mobile device users.")
-        if points:
-            return "Phishing is an IT threat:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
-
-    if re.search(r"\bhow\b.*\b(phishing|attacks?)\b.*\b(work|happen|operate)\b|\bhow do phishing attacks work\b", query):
-        points = []
-        if re.search(r"giving their financial details to a cybercriminal|financial details", text, flags=re.IGNORECASE):
-            points.append("tricking users into giving financial or personal details")
-        if re.search(r"redirecting a user's web request|spamming", text, flags=re.IGNORECASE):
-            points.append("using techniques such as spamming or redirecting a user's web request")
-        if re.search(r"user behaviors|risky behavior|email behavior", text, flags=re.IGNORECASE):
-            points.append("exploiting risky user behavior, such as unsafe email or mobile-device use")
-        if re.search(r"malware|embedded malware|computer worms", text, flags=re.IGNORECASE):
-            points.append("using malware or computer worms as part of the attack path")
-        if points:
-            return "Phishing attacks work by:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
-
-    if re.search(r"\bcybercriminals?\b|\buse phishing for\b", query):
-        points = []
-        if re.search(r"attaining personal information|personal information.*fraudulent use", text, flags=re.IGNORECASE):
-            points.append("obtaining personal information for fraudulent use")
-        if re.search(r"financial details|financial loss", text, flags=re.IGNORECASE):
-            points.append("getting financial details or causing financial loss")
-        if re.search(r"spamming|redirecting a user's web request", text, flags=re.IGNORECASE):
-            points.append("spamming or redirecting users' web requests")
-        if re.search(r"taken advantage of user behaviors|risky behavior", text, flags=re.IGNORECASE):
-            points.append("taking advantage of risky user behavior")
-        if points:
-            return "Cybercriminals use phishing for:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
-
-    if re.search(r"\b(solutions?|prevent|protect|countermeasures?|safeguards?|avoid)\b", query):
-        points = []
-        if re.search(r"simulated phishing.*embedded training|embedded training.*phishing", text, flags=re.IGNORECASE):
-            points.append("Use simulated phishing exercises with embedded training to improve resistance.")
-        if re.search(r"promote awareness|device manuals|product support|FAQs", text, flags=re.IGNORECASE):
-            points.append("Promote awareness about IT threats using resources such as device manuals, product support, and FAQs.")
-        if re.search(r"proper monitoring of accounts|stopping suspicious activities", text, flags=re.IGNORECASE):
-            points.append("Monitor accounts properly and stop suspicious activities quickly.")
-        if re.search(r"not be completely reliant on technical tools|do not give complete protection", text, flags=re.IGNORECASE):
-            points.append("Do not rely only on technical tools, because they do not provide complete protection.")
-        if re.search(r"security features|anti-malware|safeguard", text, flags=re.IGNORECASE):
-            points.append("Use available security features, safeguards, and security software.")
-        if points:
-            return "The document suggests these ways to reduce or prevent phishing risk:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
-
-    if re.search(r"\b(impact|effect|consequence|threat|risk|vulnerab)\b", query):
-        points = []
-        if re.search(r"personal information.*information security threats|personal data and information are more vulnerable", text, flags=re.IGNORECASE):
-            points.append("It makes users' personal data and information more vulnerable.")
-        if re.search(r"financial loss|financial details", text, flags=re.IGNORECASE):
-            points.append("It can lead to financial loss when users give financial details to cybercriminals.")
-        if re.search(r"perceived threat.*avoidance motivation|threat.*positively affects avoidance motivation", text, flags=re.IGNORECASE):
-            points.append("The perceived threat of phishing affects users' motivation to avoid attacks.")
-        if re.search(r"cybercriminals.*taken advantage of user behaviors|risky behavior", text, flags=re.IGNORECASE):
-            points.append("Cybercriminals take advantage of risky user behavior.")
-        if points:
-            return "The document describes the impact of phishing as follows:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
 
     return None
 
@@ -1024,6 +945,11 @@ def _textbook_answer(context, question):
         if answer:
             return answer
 
+    if re.search(r"\b(types?|classifications?|categories)\b", query) and "entrepreneurship" in query:
+        answer = _entrepreneurship_types_answer(context)
+        if answer:
+            return answer
+
     if re.search(r"\b(characteristics?|features?|traits?|qualities)\b", query):
         return _section_list_answer(
             context,
@@ -1107,6 +1033,29 @@ def _ownership_classification_answer(context):
     points = _dedupe(points)
     if len(points) >= 2:
         return "Entrepreneurship can be classified by ownership into:\n" + "\n".join(f"- {point}" for point in points[:4])
+    return None
+
+
+def _entrepreneurship_types_answer(context):
+    text = re.sub(r"\s+", " ", context or "")
+    if not re.search(r"\btypes\s+of\s+entrepreneurship\b|\bclassifications?\s+of\s+entrepreneurship\b", text, flags=re.IGNORECASE):
+        return None
+
+    classification_points = [
+        ("On the basis of ownership", r"Classification\s+on\s+the\s+Basis\s+of\s+Ownership|basis\s+of\s+ownership"),
+        ("On the basis of personality traits and style of running business", r"Classification\s+on\s+the\s+Basis\s+of\s+Personality\s+Traits|personality traits\s+and\s+their\s+style"),
+        ("Based on the type of business", r"Classification\s+based\s+on\s+the\s+Type\s+of\s+Business|type\s+of\s+business"),
+        ("Based on the stages of development", r"Classification\s+based\s+on\s+the\s+Stages\s+of\s+Development|stages\s+of\s+development"),
+        ("Other classifications", r"Other\s+Classifications"),
+    ]
+
+    points = []
+    for label, pattern in classification_points:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            points.append(label)
+
+    if len(points) >= 3:
+        return "Entrepreneurship is classified into these main types/bases:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
     return None
 
 

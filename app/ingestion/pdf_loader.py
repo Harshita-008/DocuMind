@@ -1,4 +1,4 @@
-import re
+﻿import re
 
 from pypdf import PdfReader
 

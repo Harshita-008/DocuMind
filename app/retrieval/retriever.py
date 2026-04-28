@@ -751,14 +751,6 @@ class Retriever:
             variants.add("importance")
         if term == "importance":
             variants.add("important")
-        if term in {"phishing", "phished"}:
-            variants.update({"phish", "phished", "phishing"})
-        if term in {"solution", "solutions"}:
-            variants.update({"countermeasure", "countermeasures", "safeguard", "safeguards", "protection", "protect", "preventive"})
-        if term in {"prevent", "prevents", "prevention"}:
-            variants.update({"protect", "protects", "protection", "thwart", "thwarts", "mitigate", "mitigates", "avoid", "avoidance", "stop", "stopping", "countermeasure", "safeguard"})
-        if term in {"impact", "impacts"}:
-            variants.update({"effect", "effects", "threat", "threats", "risk", "risks", "vulnerability", "vulnerabilities", "consequence", "consequences", "victimization"})
 
         # Generic nation/adjective pairs (e.g. "america"/"american")
         if term.endswith("an") and len(term) > 5:

@@ -5,10 +5,6 @@ from app.agent.generator import generate_answer
 from app.ingestion.pdf_loader import load_pdf
 from app.ingestion.chunker import chunk_text
 from app.retrieval.vector_store import VectorStore
-from app.config import MAX_CONTEXT_CHUNKS
-
-
-REFUSAL_TEXT = "I cannot answer this question from the provided document."
 
 
 def setup_index():
@@ -17,12 +13,10 @@ def setup_index():
     docs = load_pdf("data/sample.pdf")
     chunks = chunk_text(docs)
 
-    # Match the app upload flow: each evaluation run should test only the
-    # sample PDF, not stale chunks from a previously uploaded document.
-    vs = VectorStore(reset=True)
+    vs = VectorStore()
     vs.add_documents(chunks)
 
-    print(f"Indexing complete. Pages: {len(docs)}, chunks: {len(chunks)}\n")
+    print("Indexing complete.\n")
 
 
 def evaluate():
@@ -49,11 +43,7 @@ def evaluate():
         print(f"Q: {question}")
 
         results = retriever.retrieve(question)
-        filtered = filter_relevant_chunks(
-            results,
-            query=question,
-            max_chunks=MAX_CONTEXT_CHUNKS + 2,
-        )
+        filtered = filter_relevant_chunks(results)
 
         if not filtered:
             print("FAIL: No relevant context retrieved\n")
@@ -61,7 +51,7 @@ def evaluate():
             continue
 
         context = "\n\n".join([
-            f"Page {c['page']}:\n{c.get('window_text') or c['text']}" for c in filtered
+            f"Page {c['page']}:\n{c['text']}" for c in filtered
         ])
 
         answer = generate_answer(context, question)
@@ -97,11 +87,7 @@ def evaluate():
         print(f"Q: {question}")
 
         results = retriever.retrieve(question)
-        filtered = filter_relevant_chunks(
-            results,
-            query=question,
-            max_chunks=MAX_CONTEXT_CHUNKS + 2,
-        )
+        filtered = filter_relevant_chunks(results)
 
         # Case 1: No relevant context → correct refusal
         if not filtered:
@@ -113,7 +99,7 @@ def evaluate():
 
         # Case 2: Model should explicitly refuse
         context = "\n\n".join([
-            f"Page {c['page']}:\n{c.get('window_text') or c['text']}" for c in filtered
+            f"Page {c['page']}:\n{c['text']}" for c in filtered
         ])
 
         answer = generate_answer(context, question)
