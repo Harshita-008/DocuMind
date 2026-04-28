@@ -12,17 +12,8 @@ def repair_spacing_artifacts(text):
         return ""
 
     text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)
-    # Preserve list and heading boundaries before flattening newlines.
-    text = re.sub(
-        r"\s*\n+\s*(?=(?:\d{1,3}[\).]|[-*]|\u2022))",
-        "\n",
-        text,
-    )
-    text = re.sub(
-        r"\s*\n+\s*(?=[A-Z][A-Za-z0-9 /-]{2,40}:)",
-        "\n",
-        text,
-    )
+    text = re.sub(r"\s*\n+\s*(?=(?:\d{1,3}[\).]|[-*]))", "\n", text)
+    text = re.sub(r"\s*\n+\s*(?=[A-Z][A-Za-z0-9 /-]{2,40}:)", "\n", text)
     text = re.sub(r"\s*\n+\s*", " ", text)
     text = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", text)
     text = re.sub(r"(?<=[A-Za-z])(?=\d)", " ", text)
@@ -31,9 +22,6 @@ def repair_spacing_artifacts(text):
     text = re.sub(r"([.!?])(?=[A-Z])", r"\1 ", text)
     text = re.sub(r"(?<=[A-Za-z])-(?=(?:how|when|where|why|what|who|which)\b)", " - ", text)
 
-    # These patterns are generic PDF extraction repairs. They catch common
-    # glued function words such as "Itprovides" or "understandingtheprocess"
-    # without relying on any particular uploaded document.
     patterns = [
         (
             r"\b(It|This|That|These|Those|They|There|Here|We|You|He|She)"
@@ -84,7 +72,6 @@ def repair_spacing_artifacts(text):
 
     text = re.sub(r"\bAn other\b", "Another", text)
     text = re.sub(r"\ban other\b", "another", text)
-
     text = re.sub(
         r"\b(How|What|Why|When|Where|Who|Which)"
         r"(do|does|did|is|are|was|were|can|will|would|should)\b",
@@ -107,54 +94,181 @@ def repair_spacing_artifacts(text):
     return text
 
 
+def _build_replacements():
+    """Return replacement pairs as (old, new) with full Unicode support.
+
+    Using a function lets us build the strings programmatically so no
+    non-ASCII character ever appears as a raw literal inside a "..." string
+    in the source code -- avoiding any parser or editor confusion.
+    """
+    pairs = []
+
+    # Non-breaking space
+    pairs.append((" ", " "))
+
+    # Single-level mojibake: UTF-8 bytes of a typographic char misread via Windows-1252.
+    # Each sequence is built from the individual Unicode code points so the
+    # source file stays entirely ASCII-safe.
+    ldq = "“"   # LEFT DOUBLE QUOTATION MARK
+    rdq = "”"   # RIGHT DOUBLE QUOTATION MARK
+    lsq = "‘"   # LEFT SINGLE QUOTATION MARK
+    rsq = "’"   # RIGHT SINGLE QUOTATION MARK
+    emd = "—"   # EM DASH
+    end = "–"   # EN DASH
+    ell = "…"   # HORIZONTAL ELLIPSIS
+
+    # a-umlaut + euro + specific Win-1252 char = mojibake for each typographic char
+    a_um  = "â"   # a with circumflex (byte E2 misread as Latin-1)
+    euro  = "€"   # euro sign (byte 80 misread as Win-1252)
+    oe    = "œ"   # oe ligature (byte 9C as Win-1252)
+    u009d = ""   # control char (byte 9D -- undefined in Win-1252)
+    tilde = "˜"   # small tilde (byte 98 as Win-1252)
+    tm    = "™"   # trade mark (byte 99 as Win-1252)
+
+    pairs += [
+        (a_um + euro + "¦", "..."),  # ellipsis mojibake (byte A6)
+        (a_um + euro + oe,       '"'),    # left double quote mojibake
+        (a_um + euro + u009d,    '"'),    # right double quote mojibake
+        (a_um + euro + tilde,    "'"),    # left single quote mojibake
+        (a_um + euro + tm,       "'"),    # right single quote mojibake
+        (a_um + euro + rdq,      "-"),    # em dash mojibake (94 -> rdq in Win-1252)
+        (a_um + euro + ldq,      "-"),    # en dash mojibake (93 -> ldq in Win-1252)
+    ]
+
+    # Direct Unicode typographic characters -> plain ASCII equivalents
+    pairs += [
+        (ldq, '"'),
+        (rdq, '"'),
+        (lsq, "'"),
+        (rsq, "'"),
+        (emd, "-"),
+        (end, "-"),
+        (ell, "..."),
+    ]
+
+    return pairs
+
+
+_REPLACEMENTS = _build_replacements()
+
+
 def clean_text(text):
     if not text:
         return ""
 
     text = CONTROL_CHARS.sub(" ", text)
-    text = text.replace("\u00a0", " ")
 
-    replacements = {
-        "â€¦": " ",
-        "Ã¢â‚¬Â¦": " ",
-        "Ã¢â€ â€™": "->",
-        "Ã¢â‚¬â€": "-",
-        "Ã¢â‚¬â€œ": "-",
-        "Ã¢â‚¬Ëœ": "'",
-        "Ã¢â‚¬â„¢": "'",
-        "Ã¢â‚¬Å“": '"',
-        "Ã¢â‚¬": '"',
-        "â€œ": '"',
-        "â€": '"',
-        "â€˜": "'",
-        "â€™": "'",
-        "“": '"',
-        "”": '"',
-        "‘": "'",
-        "’": "'",
-        "—": "-",
-        "–": "-",
-    }
-    for old, new in replacements.items():
+    for old, new in _REPLACEMENTS:
         text = text.replace(old, new)
 
     text = repair_spacing_artifacts(text)
 
-    # Remove textbook blanks and separator-like artifacts.
+    # Remove dot-leader and underline artifacts common in textbook PDFs.
     text = re.sub(r"[.]{2,}", " ", text)
     text = re.sub(r"[-_]{2,}", " ", text)
 
-    # Fix common extraction splits seen in scanned textbook headings.
-    text = re.sub(r"\bC\s+lassification", "Classification", text)
-    text = re.sub(r"\bM\s+anaging", "Managing", text)
-    text = re.sub(r"\bG\s+lobalization", "Globalization", text)
-
     text = re.sub(r"\s+", " ", text)
 
-    if "References" in text:
-        text = text.split("References")[0]
+    # Strip References / Bibliography only when it is a standalone section
+    # heading (own line) -- avoids cutting paragraphs that merely contain
+    # the word "references" in passing.
+    text = re.sub(
+        r"\n\s*(?:References?|Bibliography)\s*\n.*",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
     return text.strip()
+
+
+def _clean_page_noise(text):
+    lines = []
+    for raw_line in (text or "").splitlines():
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if re.search(r"\bcontents lists available at\b|\bjournal homepage\b|\bwww\.", lowered):
+            continue
+        if re.search(r"^\d+\s+of\s+\d+$", lowered):
+            continue
+        if re.search(r"\b(?:received|accepted|available online)\b", lowered):
+            continue
+        if re.search(r"^https?://", lowered):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _extract_with_pymupdf(file_path):
+    try:
+        import fitz
+    except Exception:
+        return []
+
+    docs = []
+    try:
+        pdf = fitz.open(file_path)
+    except Exception:
+        return []
+
+    for index, page in enumerate(pdf):
+        blocks = []
+        try:
+            raw_blocks = page.get_text("blocks")
+        except Exception:
+            raw_blocks = []
+
+        for block in raw_blocks:
+            if len(block) < 5:
+                continue
+            x0, y0, x1, y1, block_text = block[:5]
+            block_text = _clean_page_noise(block_text)
+            if not block_text:
+                continue
+            blocks.append({
+                "x0": float(x0),
+                "y0": float(y0),
+                "x1": float(x1),
+                "text": block_text,
+            })
+
+        if not blocks:
+            continue
+
+        width = float(page.rect.width)
+        split = width / 2.0
+        full_width = []
+        left = []
+        right = []
+
+        for block in blocks:
+            center = (block["x0"] + block["x1"]) / 2.0
+            if block["x0"] < width * 0.18 and block["x1"] > width * 0.82:
+                full_width.append(block)
+            elif center < split:
+                left.append(block)
+            else:
+                right.append(block)
+
+        ordered = []
+        for group in (full_width, left, right):
+            ordered.extend(
+                block["text"]
+                for block in sorted(group, key=lambda item: (item["y0"], item["x0"]))
+            )
+
+        text = clean_text("\n".join(ordered))
+        if text:
+            docs.append({"text": text, "page": index + 1})
+
+    try:
+        pdf.close()
+    except Exception:
+        pass
+
+    return docs
 
 
 def extract_page_text(page):
@@ -195,6 +309,10 @@ def text_quality_score(text):
 
 
 def load_pdf(file_path):
+    pymupdf_docs = _extract_with_pymupdf(file_path)
+    if pymupdf_docs:
+        return pymupdf_docs
+
     reader = PdfReader(file_path)
     docs = []
 

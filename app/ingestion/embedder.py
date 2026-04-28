@@ -37,18 +37,18 @@ def _get_sentence_transformer():
     try:
         from sentence_transformers import SentenceTransformer
 
-        _model = SentenceTransformer(EMBEDDING_MODEL, local_files_only=True)
+        # Allow the model to be downloaded on first use if not already cached.
+        # Removing local_files_only=True ensures the embedding model is always
+        # available rather than silently falling back to the hash-based stub.
+        _model = SentenceTransformer(EMBEDDING_MODEL)
         return _model
     except Exception:
         return None
 
 
 def _fallback_embedding(text):
-    """Offline lexical embedding fallback.
-
-    SentenceTransformers gives better semantic recall when the model is
-    installed or cached. This fallback keeps the app functional without network
-    access by hashing normalized words and bigrams into a cosine-ready vector.
+    """Hash-based lexical fallback used only when sentence-transformers is
+    unavailable.  This has poor semantic recall — it is a last resort.
     """
     tokens = re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", (text or "").lower())
     features = []

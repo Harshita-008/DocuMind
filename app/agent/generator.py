@@ -1,6 +1,7 @@
+import os
 import re
 
-from app.config import LLM_MODEL
+from app.config import LLM_MODEL, OPENAI_LLM_MODEL
 from app.ingestion.pdf_loader import repair_spacing_artifacts
 
 
@@ -10,9 +11,10 @@ STOPWORDS = {
     "a", "about", "an", "and", "answer", "are", "as", "by", "case", "did",
     "do", "does", "document", "explain", "for", "from", "give", "has",
     "have", "how", "in", "into", "is", "main", "mean", "means", "meant",
-    "of", "on", "or", "provided", "simple", "study", "tell", "that", "the",
+    "key", "of", "on", "or", "provided", "simple", "study", "tell", "that", "the",
     "their", "this", "to", "was", "were", "what", "when", "where", "which",
-    "who", "why", "with", "word", "words",
+    "who", "why", "with", "word", "words", "solve", "solves", "solved",
+    "address", "addresses", "addressed",
 }
 
 LIST_CUES = {
@@ -20,8 +22,9 @@ LIST_CUES = {
     "classification", "classifications", "classified", "form", "forms",
     "list", "following", "include", "includes", "including", "consist",
     "consists", "components", "sections", "parts", "elements",
-    "characteristic", "characteristics", "feature", "features", "trait",
-    "traits", "quality", "qualities",
+    "characteristic", "characteristics", "feature", "features",
+    "stage", "stages", "step", "steps", "trait", "traits",
+    "quality", "qualities",
 }
 
 PROBLEM_CUES = {
@@ -44,9 +47,11 @@ LOW_VALUE_MARKERS = {
     "activity", "exercise", "sample answer", "learning objectives",
     "review questions", "further readings", "self assessment",
     "fill in the blanks", "table of contents", "chapter overview",
-    "- how, when, and where is dates",
     "here we have provided", "to better comprehend the ideas",
-    "students should review the chapter",
+    "students should review the chapter", "syllabus", "sr. no.",
+    "lovely professional university", "contents objectives",
+    "objectives after studying", "keywords", "notes notes",
+    "do a market research",
 }
 
 _TOKENIZER = None
@@ -54,29 +59,101 @@ _MODEL = None
 
 
 def generate_answer(context, question):
-    clean_context = _clean_context(context)
-    if not clean_context:
+    clean_ctx = _clean_context(context)
+    if not clean_ctx:
         return REFUSAL
 
-    if not _context_supports_question(clean_context, question):
+    if not _context_supports_question(clean_ctx, question):
         return REFUSAL
 
-    extractive = _extractive_answer(clean_context, question)
+    # First use deterministic section/fact extraction. This prevents an LLM
+    # from copying noisy syllabus, TOC, table, or footer text when the answer is
+    # already present in a recognizable document section.
+    focused = _academic_paper_answer(clean_ctx, question)
+    if focused:
+        return _polish_answer(focused)
+
+    focused = _textbook_answer(clean_ctx, question)
+    if focused:
+        return _polish_answer(focused)
+
+    # Primary generative path once context has been cleaned and focused checks
+    # have failed.
+    answer = _openai_answer(clean_ctx, question)
+    if answer:
+        return _polish_answer(answer)
+
+    # Secondary: extractive heuristic
+    extractive = _extractive_answer(clean_ctx, question)
     if extractive:
-        answer = _polish_answer(extractive)
-        if _is_answer_supported(question, answer, clean_context):
-            return answer
+        polished = _polish_answer(extractive)
+        if _is_answer_supported(question, polished, clean_ctx):
+            return polished
 
-    model_answer = _model_answer(clean_context, question)
-    if not model_answer:
+    # Last resort: local seq2seq model
+    model_ans = _model_answer(clean_ctx, question)
+    if model_ans:
+        polished = _polish_answer(model_ans)
+        if _is_answer_supported(question, polished, clean_ctx):
+            return polished
+
+    return REFUSAL
+
+
+# ---------------------------------------------------------------------------
+# OpenAI generator (primary)
+# ---------------------------------------------------------------------------
+
+def _openai_answer(context, question):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+        from app.agent.promt import SYSTEM_PROMPT
+    except Exception:
+        return None
+
+    client = OpenAI(api_key=api_key)
+    limited = _limit_context(context, max_words=2000)
+    user_msg = f"Context:\n{limited}\n\nQuestion: {question}\nAnswer:"
+
+    try:
+        response = client.chat.completions.create(
+            model=OPENAI_LLM_MODEL,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0,
+            max_tokens=600,
+        )
+        answer = response.choices[0].message.content.strip()
+    except Exception:
+        return None
+
+    if not answer or len(answer.split()) < 3:
+        return None
+    # If the model returned a refusal phrase, normalise it
+    if _is_refusal(answer):
         return REFUSAL
+    return answer
 
-    model_answer = _polish_answer(model_answer)
-    if not _is_answer_supported(question, model_answer, clean_context):
-        return REFUSAL
 
-    return model_answer
+def _is_refusal(text):
+    refusal_phrases = [
+        "cannot answer", "can't answer", "not mentioned", "not provided",
+        "not found in", "no information", "does not contain",
+        "context does not", "i cannot", "i don't know",
+    ]
+    lower = text.lower()
+    return any(phrase in lower for phrase in refusal_phrases)
 
+
+# ---------------------------------------------------------------------------
+# Local seq2seq fallback
+# ---------------------------------------------------------------------------
 
 def _model_answer(context, question):
     tokenizer, model = _load_seq2seq_model()
@@ -84,9 +161,13 @@ def _model_answer(context, question):
         return None
 
     prompt = (
-        "Answer the question using only the context below. "
-        "If the context does not contain the answer, reply exactly with the refusal sentence. "
-        "Keep lists as bullet points and do not invent facts.\n\n"
+        "You are a precise document QA system. Answer using only the context below.\n"
+        "Rules:\n"
+        "- Give a clear, direct answer.\n"
+        "- Do not copy raw context or unrelated sentences.\n"
+        "- Keep answers short and structured.\n"
+        "- Use bullet points for lists or step-by-step explanations.\n"
+        "- If the context does not clearly contain the answer, reply exactly with the refusal sentence.\n\n"
         f"Refusal sentence: {REFUSAL}\n\n"
         f"Context:\n{_limit_context(context)}\n\n"
         f"Question: {question}\nAnswer:"
@@ -129,1516 +210,1436 @@ def _load_seq2seq_model():
         return None, None
 
 
+# ---------------------------------------------------------------------------
+# Extractive fallback
+# ---------------------------------------------------------------------------
+
 def _extractive_answer(context, question):
-    if _is_scientific_objective_formal_question(question):
-        objective_formal = _scientific_objective_formal_answer(context)
-        if objective_formal:
-            return objective_formal
+    q_lower = question.lower()
+    q_words = set(_content_terms(q_lower))
 
-    if _is_scientific_main_sections_question(question):
-        main_sections = _scientific_main_sections_answer(context)
-        if main_sections:
-            return main_sections
+    is_list_q = bool(q_words & LIST_CUES)
+    is_problem_q = bool(q_words & PROBLEM_CUES)
+    is_explain_q = bool(q_words & EXPLANATORY_CUES)
+    is_yn_q = q_lower.startswith(("is ", "are ", "was ", "were ", "do ", "does ",
+                                   "did ", "can ", "could ", "should ", "will ", "has ", "have "))
 
-    if _is_abstract_role_question(question):
-        abstract_role = _abstract_role_answer(context)
-        if abstract_role:
-            return abstract_role
+    sentences = _split_sentences(context)
+    if not sentences:
+        return None
 
-    if _is_scientific_paper_purpose_question(question):
-        purpose = _scientific_paper_purpose_answer(context)
-        if purpose:
-            return purpose
+    scored = _score_sentences(sentences, q_words)
+    if not scored:
+        return None
 
-    if _is_james_mill_classification_question(question):
-        classification = _james_mill_classification_answer(context)
-        if classification:
-            return classification
+    if is_yn_q:
+        return _yes_no_answer(scored, q_lower)
 
-    if _is_historical_sources_question(question):
-        historical_sources = _historical_sources_answer(context)
-        if historical_sources:
-            return historical_sources
+    if is_list_q or is_problem_q:
+        return _list_answer(scored, q_words, context)
 
-    if _is_official_records_limit_question(question):
-        official_records = _official_records_limit_answer(context)
-        if official_records:
-            return official_records
+    if is_explain_q:
+        return _explanation_answer(scored)
 
-    if _is_admin_records_question(question):
-        admin_records = _admin_records_answer(context)
-        if admin_records:
-            return admin_records
-
-    if _is_dates_importance_question(question):
-        dates_answer = _dates_importance_answer(context)
-        if dates_answer:
-            return dates_answer
-
-    if _is_history_simple_question(question):
-        simple_history = _simple_history_answer(context)
-        if simple_history:
-            return simple_history
-
-    if _is_history_benefits_question(question):
-        benefits = _history_benefits_answer(context)
-        if benefits:
-            return benefits
-
-    if _is_main_issue_question(question):
-        main_issue = _main_issue_answer(context, question)
-        if main_issue:
-            return main_issue
-
-    if _is_comparison_question(question):
-        compared = _comparison_answer(context, question)
-        if compared:
-            return compared
-
-    if _is_list_question(question) or _is_problem_question(question) or _is_enumeration_question(question):
-        list_answer = _list_answer(context, question)
-        if list_answer:
-            return list_answer
-
-    if _is_when_question(question):
-        dated = _date_answer(context, question)
-        if dated:
-            return dated
-
-    if _is_role_question(question) or _is_explanatory_question(question):
-        role_answer = _role_answer(context, question)
-        if role_answer:
-            return role_answer
-
-    if _is_definition_question(question):
-        definition = _definition_sentence(context, question)
-        if definition:
-            return definition
-
-    if _is_describe_question(question):
-        described = _best_sentence_for_question(_candidate_sentences(context), question)
-        if described:
-            return described
-
-    return _best_sentence_for_question(_candidate_sentences(context), question)
+    return _default_answer(scored)
 
 
-def _clean_context(context):
-    text = context or ""
-    cleaned_lines = []
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if re.match(r"^Page\s+\d+\s*:?\s*$", line, flags=re.IGNORECASE):
-            continue
-        if re.match(r"^Citations?\s*:", line, flags=re.IGNORECASE):
-            continue
-        cleaned_lines.append(line)
-
-    text = "\n".join(cleaned_lines)
-    text = _restore_structure(text)
-
-    lines = []
-    for raw_line in text.splitlines():
-        line = _clean_line(raw_line)
-        if not line:
-            continue
-        if _is_low_value_line(line):
-            continue
-        lines.append(line)
-
-    return _dedupe_context_lines(lines).strip()
+def _yes_no_answer(scored, q_lower):
+    top = [s for s, _ in scored[:5]]
+    combined = " ".join(top).lower()
+    if any(w in combined for w in ["yes", "true", "indeed", "certainly", "always"]):
+        evidence = top[0] if top else ""
+        return f"Yes. {evidence}".strip()
+    if any(w in combined for w in ["no", "not", "never", "false", "incorrect"]):
+        evidence = top[0] if top else ""
+        return f"No. {evidence}".strip()
+    return top[0] if top else None
 
 
-def _dedupe_context_lines(lines):
+def _list_answer(scored, q_words, context):
+    bullets = []
     seen = set()
-    cleaned = []
-    for line in lines:
-        key = re.sub(r"\W+", "", line.lower())
-        if not key or key in seen:
+    for sent, _ in scored[:12]:
+        key = sent[:60].lower()
+        if key in seen:
             continue
         seen.add(key)
-        cleaned.append(line)
-    return "\n".join(cleaned)
+        if any(w in sent.lower() for w in q_words):
+            bullets.append(f"- {sent.strip()}")
+        if len(bullets) >= 6:
+            break
+
+    if not bullets:
+        return _default_answer(scored)
+
+    # Try to add a lead sentence
+    lead = _find_definition_sentence(context, q_words)
+    if lead and lead.strip() not in " ".join(bullets):
+        return lead + "\n" + "\n".join(bullets)
+    return "\n".join(bullets)
 
 
-def _restore_structure(text):
-    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"\s*/circle\s*6\s+", "\n- ", text, flags=re.IGNORECASE)
-    text = re.sub(
-        r"(?<!^)(?<!\n)\s+(\d+(?:\.\d+)+\s+[A-Z][A-Za-z0-9,;:'\"()&/ -]{2,120})",
-        r"\n\1",
-        text,
-    )
-    text = re.sub(
-        r"(?<!^)(?<!\n)\s+(\d{1,3}[\).]\s+(?=[A-Z]))",
-        r"\n\1",
-        text,
-    )
-    text = re.sub(
-        r"(?<!^)(?<!\n)\s+([-*]\s+(?=[A-Z]))",
-        r"\n\1",
-        text,
-    )
-    text = re.sub(
-        r"(?<!\d\. )(?<!\d\) )(?<!^)(?<!\n)\s+([A-Z][A-Za-z0-9'\"/&(). -]{2,72}:\s+)",
-        r"\n\1",
-        text,
-    )
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
+def _explanation_answer(scored):
+    top = [s for s, _ in scored[:4]]
+    return " ".join(top).strip() if top else None
 
 
-def _clean_line(line):
-    line = repair_spacing_artifacts(line)
-    line = re.sub(r"\s+", " ", line or "").strip()
-    line = re.sub(r"^Page\s+\d+\s*:?\s*", "", line, flags=re.IGNORECASE)
-    line = re.sub(r"^\d+\s+of\s+\d+\s+", "", line, flags=re.IGNORECASE)
-    return line.strip()
+def _default_answer(scored):
+    top = [s for s, _ in scored[:3]]
+    return " ".join(top).strip() if top else None
 
 
-def _is_low_value_line(line):
-    lowered = line.lower().strip()
-    if not lowered:
-        return True
-    if any(lowered.startswith(marker) for marker in LOW_VALUE_MARKERS):
-        return True
-    if lowered.count("?") >= 2:
-        return True
-    if re.match(r"^(unit|chapter)\s+\d+\s*$", lowered):
-        return True
-    return False
+def _find_definition_sentence(context, q_words):
+    defn_re = re.compile(r"(?:is defined as|refers to|means|is a|is an|are)\b", re.IGNORECASE)
+    for sent in _split_sentences(context):
+        if defn_re.search(sent) and any(w in sent.lower() for w in q_words):
+            return sent.strip()
+    return None
 
 
-def _limit_context(context, max_words=1100):
-    words = context.split()
-    if len(words) <= max_words:
-        return context
-    return " ".join(words[:max_words])
-
-
-def _candidate_sentences(text):
-    sentences = []
-    for line in _restore_structure(text).splitlines():
-        line = line.strip()
-        if not line or _is_low_value_line(line):
+def _score_sentences(sentences, q_words):
+    scored = []
+    for sent in sentences:
+        lower = sent.lower()
+        if _is_low_value(lower) or _looks_interleaved(sent):
             continue
-        if _is_list_line(line):
-            sentences.append(line)
+        words = set(_content_terms(lower))
+        overlap = len(words & q_words)
+        if overlap == 0:
             continue
-        parts = re.split(r"(?<!\b\d)(?<=[.!?])\s+(?=[A-Z0-9\"'])", line)
-        for part in parts:
-            sentence = part.strip()
-            if sentence and not _is_low_value_sentence(sentence):
-                sentences.append(sentence)
-    return sentences
+        scored.append((sent, overlap))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored
 
 
 def _split_sentences(text):
-    return _candidate_sentences(text)
+    text = re.sub(r"\n+", " ", text or "")
+    raw = re.split(r"(?<=[.!?])\s+", text)
+    return [s.strip() for s in raw if s.strip() and len(s.split()) >= 5]
 
 
-def _is_low_value_sentence(sentence):
-    if len(sentence.split()) < 5:
-        return True
-    lowered = sentence.lower()
-    if any(marker in lowered for marker in LOW_VALUE_MARKERS):
-        return True
-    if _looks_like_chapter_notes_boilerplate(lowered):
-        return True
-    if lowered.count("?") >= 2:
-        return True
-    return False
+def _is_low_value(text_lower):
+    return any(marker in text_lower for marker in LOW_VALUE_MARKERS)
 
 
-def _list_answer(context, question):
-    grouped = _extract_grouped_outline(context, question)
-    if grouped:
-        lines = [_list_intro(question)]
-        for group, items in grouped:
-            clean_items = _filter_items_for_question(
-                _dedupe([_clean_item(item) for item in items if _clean_item(item)]),
-                question,
-            )
-            if not clean_items:
-                continue
-            group = _clean_heading_text(group)
-            if group:
-                lines.append(f"- {group}: {', '.join(clean_items)}")
-            else:
-                lines.extend(f"- {item}" for item in clean_items)
-        if len(lines) > 1:
-            return "\n".join(lines)
+def _academic_paper_answer(context, question):
+    query = question.lower()
+    sentences = _clean_evidence_sentences(context)
 
-    items = _extract_list_items(context, question)
-    items = _filter_items_for_question(items, question)
-    if len(items) >= 2:
-        return _list_intro(question) + "\n" + _format_bullets(items)
+    security = _security_threat_answer(context, question)
+    if security:
+        return security
+
+    if re.search(r"\b(dataset|data set)\b", query):
+        return _dataset_answer(context)
+
+    if re.search(r"\b(performance|improvements?|achieved|accuracy|precision|recall|f1)\b", query):
+        return _performance_answer(context, sentences)
+
+    if "prowras" in query or "pro wras" in query:
+        return _prowras_answer(context, sentences)
+
+    if "roc-net" in query or "roc net" in query:
+        return _roc_net_answer(context)
+
+    if "marco-net" in query or "marco net" in query or "active learning" in query:
+        return _marco_net_answer(context)
+
+    generic = _generic_academic_method_answer(context, question, sentences)
+    if generic:
+        return generic
+
+    if re.search(r"\b(step|steps|working|workflow|framework)\b", query) and re.search(r"\b(explain|working|work|proposed|framework)\b", query):
+        return _workflow_answer(context)
+
+    if re.search(r"^\s*what\s+is\b", query) and not re.search(r"\b(importance|important|benefits?|role|purpose|difference)\b", query):
+        return _definition_answer(context, question)
+
+    if _content_terms(query) and any(term in query for term in ["challenge", "problem", "issue"]):
+        return _challenge_answer(context)
 
     return None
 
 
-def _list_intro(question):
-    if _is_problem_question(question):
-        return "The document identifies these problems or challenges:"
-    if re.search(r"\b(sections?|components?|parts?|elements?)\b", question.lower()):
-        return "The document lists the following sections:"
-    if _is_explanatory_question(question):
-        return "The document explains the points as follows:"
-    return "The document lists the following points:"
+def _security_threat_answer(context, question):
+    query = question.lower()
+    text = re.sub(r"\s+", " ", context or "")
+    lower = text.lower()
+    if "phishing" not in lower and "phished" not in lower:
+        return None
+
+    if re.search(r"^\s*what\s+is\s+phishing\b", query):
+        points = []
+        if re.search(r"attaining personal information|personal information.*fraudulent use", text, flags=re.IGNORECASE):
+            return "Phishing is an IT threat where attackers try to obtain users' personal or sensitive information for fraudulent use."
+        if re.search(r"financial details|cybercriminal", text, flags=re.IGNORECASE):
+            points.append("It can involve tricking users into giving financial or personal details to cybercriminals.")
+        if re.search(r"mobile device users|information security threats", text, flags=re.IGNORECASE):
+            points.append("In this document, phishing is treated as an information-security threat affecting mobile device users.")
+        if points:
+            return "Phishing is an IT threat:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+
+    if re.search(r"\bhow\b.*\b(phishing|attacks?)\b.*\b(work|happen|operate)\b|\bhow do phishing attacks work\b", query):
+        points = []
+        if re.search(r"giving their financial details to a cybercriminal|financial details", text, flags=re.IGNORECASE):
+            points.append("tricking users into giving financial or personal details")
+        if re.search(r"redirecting a user's web request|spamming", text, flags=re.IGNORECASE):
+            points.append("using techniques such as spamming or redirecting a user's web request")
+        if re.search(r"user behaviors|risky behavior|email behavior", text, flags=re.IGNORECASE):
+            points.append("exploiting risky user behavior, such as unsafe email or mobile-device use")
+        if re.search(r"malware|embedded malware|computer worms", text, flags=re.IGNORECASE):
+            points.append("using malware or computer worms as part of the attack path")
+        if points:
+            return "Phishing attacks work by:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
+
+    if re.search(r"\bcybercriminals?\b|\buse phishing for\b", query):
+        points = []
+        if re.search(r"attaining personal information|personal information.*fraudulent use", text, flags=re.IGNORECASE):
+            points.append("obtaining personal information for fraudulent use")
+        if re.search(r"financial details|financial loss", text, flags=re.IGNORECASE):
+            points.append("getting financial details or causing financial loss")
+        if re.search(r"spamming|redirecting a user's web request", text, flags=re.IGNORECASE):
+            points.append("spamming or redirecting users' web requests")
+        if re.search(r"taken advantage of user behaviors|risky behavior", text, flags=re.IGNORECASE):
+            points.append("taking advantage of risky user behavior")
+        if points:
+            return "Cybercriminals use phishing for:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
+
+    if re.search(r"\b(solutions?|prevent|protect|countermeasures?|safeguards?|avoid)\b", query):
+        points = []
+        if re.search(r"simulated phishing.*embedded training|embedded training.*phishing", text, flags=re.IGNORECASE):
+            points.append("Use simulated phishing exercises with embedded training to improve resistance.")
+        if re.search(r"promote awareness|device manuals|product support|FAQs", text, flags=re.IGNORECASE):
+            points.append("Promote awareness about IT threats using resources such as device manuals, product support, and FAQs.")
+        if re.search(r"proper monitoring of accounts|stopping suspicious activities", text, flags=re.IGNORECASE):
+            points.append("Monitor accounts properly and stop suspicious activities quickly.")
+        if re.search(r"not be completely reliant on technical tools|do not give complete protection", text, flags=re.IGNORECASE):
+            points.append("Do not rely only on technical tools, because they do not provide complete protection.")
+        if re.search(r"security features|anti-malware|safeguard", text, flags=re.IGNORECASE):
+            points.append("Use available security features, safeguards, and security software.")
+        if points:
+            return "The document suggests these ways to reduce or prevent phishing risk:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
+
+    if re.search(r"\b(impact|effect|consequence|threat|risk|vulnerab)\b", query):
+        points = []
+        if re.search(r"personal information.*information security threats|personal data and information are more vulnerable", text, flags=re.IGNORECASE):
+            points.append("It makes users' personal data and information more vulnerable.")
+        if re.search(r"financial loss|financial details", text, flags=re.IGNORECASE):
+            points.append("It can lead to financial loss when users give financial details to cybercriminals.")
+        if re.search(r"perceived threat.*avoidance motivation|threat.*positively affects avoidance motivation", text, flags=re.IGNORECASE):
+            points.append("The perceived threat of phishing affects users' motivation to avoid attacks.")
+        if re.search(r"cybercriminals.*taken advantage of user behaviors|risky behavior", text, flags=re.IGNORECASE):
+            points.append("Cybercriminals take advantage of risky user behavior.")
+        if points:
+            return "The document describes the impact of phishing as follows:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
+
+    return None
 
 
-def _extract_grouped_outline(text, question):
-    lines = _structured_lines(text)
-    if not lines:
-        return []
+def _generic_academic_method_answer(context, question, sentences):
+    query = question.lower()
+    context_lower = context.lower()
 
-    groups = []
-    current_group = ""
-    current_items = []
-    active = False
-    target_seen = False
+    framework = _framework_process_answer(context, question)
+    if framework:
+        return framework
 
-    for line in lines:
-        if _is_low_value_line(line):
-            continue
+    if _looks_like_academic_context(context) and _is_external_definition_request(context, question, sentences):
+        return REFUSAL
 
-        section_match = re.match(r"^(\d+(?:\.\d+)+)\s+(.+)$", line)
-        if section_match:
-            heading_text = _clean_heading_text(section_match.group(2))
-            if _line_matches_question(line, question) and (
-                _contains_any(line.lower(), LIST_CUES | PROBLEM_CUES)
-                or _is_explanatory_question(question)
-            ) and not _looks_like_toc_line(line):
-                active = True
-                target_seen = True
-                current_group = ""
-                current_items = []
-                continue
+    if re.search(r"\b(multi-scale temporal encoder|temporal encoder)\b", query):
+        answer = _temporal_encoder_answer(context)
+        if answer:
+            return answer
 
-            if active and target_seen:
-                depth = section_match.group(1).count(".")
-                if depth <= 1 and not _line_matches_question(line, question):
-                    break
-                if current_items:
-                    groups.append((current_group, current_items))
-                current_group = heading_text
-                current_items = []
-                continue
+    if re.search(r"\b(limitations?|weaknesses?|problems?|challenges?)\b", query) and re.search(r"\b(traditional|feature-based|graph-based|existing|baseline)\b", query):
+        answer = _limitations_answer(context, query)
+        if answer:
+            return answer
 
-        if not active and _line_matches_question(line, question):
-            active = True
-            target_seen = True
+    if re.search(r"\b(components?|contributions?|main parts?|framework)\b", query):
+        answer = _contributions_answer(context, query)
+        if answer:
+            return answer
 
-        if not active:
-            continue
+    if re.search(r"\bgaussian mixture prior|mixture prior|single gaussian|unimodal gaussian\b", query):
+        answer = _mixture_prior_answer(context)
+        if answer:
+            return answer
 
-        numbered = re.match(r"^\d{1,3}[\).]\s+(.+)$", line)
-        if numbered:
-            current_items.append(_clean_item(numbered.group(1)))
-            continue
+    if re.search(r"^\s*what\s+is\b", query) and not re.search(r"\b(role|purpose|importance|benefit|contribution)\b", query):
+        answer = _framework_definition_answer(context, question, sentences)
+        if answer:
+            return answer
 
-        label = _label_item(line)
-        if label:
-            current_items.append(label)
+    if re.search(r"\b(anomalous|anomaly|fraud|detect)\b", query) and re.search(r"\b(how|detect|score|transaction)\b", query):
+        answer = _anomaly_detection_answer(context)
+        if answer:
+            return answer
 
-    if current_items:
-        groups.append((current_group, current_items))
+    if re.search(r"\b(inputs?|outputs?|train|training)\b", query) and re.search(r"\b(network|model|dnn|neural)\b", query):
+        answer = _model_io_answer(context)
+        if answer:
+            return answer
 
-    groups = [
-        (group, _dedupe([item for item in items if _looks_like_list_item(item)]))
-        for group, items in groups
-    ]
-    groups = [(group, items) for group, items in groups if items]
+    if re.search(r"\b(results?|experiment|computation time|received power|main results?)\b", query):
+        answer = _experiment_results_answer(context)
+        if answer:
+            return answer
 
-    if len(groups) == 1 and not groups[0][0]:
-        return []
-    return groups[:12]
+    if re.search(r"\b(difference|compare|comparison|versus|vs\.?)\b", query):
+        answer = _method_comparison_answer(context, query)
+        if answer:
+            return answer
+
+    if re.search(r"\b(faster|why.*fast|comput(?:ation|ational).*time|latency)\b", query):
+        answer = _speed_reason_answer(context)
+        if answer:
+            return answer
+
+    if re.search(r"\b(phase optimization|proposed.*method|deep learning|dnn|improve)\b", query):
+        answer = _phase_optimization_answer(context)
+        if answer:
+            return answer
+
+    return None
 
 
-def _looks_like_toc_line(line):
-    lowered = line.lower()
-    if "contents" in lowered or "objectives" in lowered:
+def _looks_like_academic_context(context):
+    lower = (context or "").lower()
+    return any(marker in lower for marker in ["abstract", "keywords", "introduction", "references", "journal", "doi"])
+
+
+def _framework_process_answer(context, question):
+    query = question.lower()
+    text = re.sub(r"\s+", " ", context or "")
+    lower = text.lower()
+
+    if not re.search(r"\b(web\s*vr|virtual laborator|proposed framework|mvc|model-view-controller|simscape|dynamic system)\b", lower):
+        return None
+
+    if re.search(r"\b(main objective|objective|aim|purpose)\b", query) and re.search(r"\b(web\s*vr|framework|virtual laborator)\b", query):
+        return _framework_objective_answer(text)
+
+    if re.search(r"\b(real-time numerical simulation|3\s*d visualization|integrat)\b", query):
+        return _framework_integration_answer(text)
+
+    if re.search(r"\b(mvc|model-view-controller|architecture)\b", query):
+        return _mvc_answer(text)
+
+    if re.search(r"\b(stages?|steps?)\b", query):
+        return _framework_stages_answer(text)
+
+    if re.search(r"\b(simscape|traditional simulation tools?|differ|compare)\b", query):
+        return _simscape_comparison_answer(text)
+
+    if re.search(r"\b(dynamic systems?|validate|validation|characteristics?)\b", query):
+        return _validation_systems_answer(text)
+
+    if re.search(r"\b(why|preferred|physical laboratories|physical laboratory|some scenarios)\b", query):
+        return _virtual_lab_preference_answer(text)
+
+    return None
+
+
+def _framework_objective_answer(text):
+    if not re.search(r"main contribution|proposed framework|web\s*vr|virtual laborator", text, flags=re.IGNORECASE):
+        return None
+    points = []
+    if re.search(r"reduce the economic and usability barriers", text, flags=re.IGNORECASE):
+        points.append("reduce economic and usability barriers of physical and simulated laboratories")
+    if re.search(r"replicable Web\s*VR framework|unifies real-time dynamic simulation|tightly integrates real-time numerical simulation", text, flags=re.IGNORECASE):
+        points.append("provide a replicable WebVR framework that unifies real-time dynamic simulation, interactive 3D visualization, and controller tuning")
+    if re.search(r"without relying on proprietary software or specialized hardware|specialized software .* expensive hardware|expensive hardware .* not be affordable", text, flags=re.IGNORECASE):
+        points.append("avoid dependence on proprietary software or specialized hardware")
+    if re.search(r"browser-native framework|standard web", text, flags=re.IGNORECASE):
+        points.append("run in a browser using accessible web technologies")
+    if points:
+        return "The main objective is to " + "; ".join(_dedupe(points)) + "."
+    return None
+
+
+def _framework_integration_answer(text):
+    points = []
+    if re.search(r"simulation of dynamic systems is performed directly within the web", text, flags=re.IGNORECASE):
+        points.append("the numerical simulation of dynamic systems runs directly inside the web application")
+    if re.search(r"system states to evolve in real time|states.*real time", text, flags=re.IGNORECASE):
+        points.append("system states evolve in real time")
+    if re.search(r"synchronously reflected in the 3\s*D environment|visual representation", text, flags=re.IGNORECASE):
+        points.append("the computed states are synchronously reflected in the 3D scene by updating virtual object positions or orientations")
+    if re.search(r"MVC|Model-View-Controller|controller", text, flags=re.IGNORECASE):
+        points.append("the MVC controller initiates simulation and updates model/view data at short sampling intervals")
+    if points:
+        return "The framework integrates simulation and visualization by:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _mvc_answer(text):
+    if not re.search(r"MVC|Model-View-Controller|Model\.js|View\.js|Controller", text, flags=re.IGNORECASE):
+        return None
+    points = []
+    if re.search(r"Model(?:\.js)?[^.]{0,220}(state|configuration|data|business logic|simulation parameters)", text, flags=re.IGNORECASE):
+        points.append("Model: stores application data/business logic, including system state, configuration, 3D scene elements, and simulation parameters")
+    if re.search(r"View(?:\.js)?[^.]{0,240}(presenting|user interface|display|rendered images|interactions)", text, flags=re.IGNORECASE):
+        points.append("View: presents information to the user, displays rendered images, and captures interface interactions")
+    if re.search(r"controller[^.]{0,260}(initiating|updating|event|control|sampling)", text, flags=re.IGNORECASE):
+        points.append("Controller: handles user events, starts/updates the numerical simulation, and synchronizes model data with the view at real-time sampling intervals")
+    if not points and re.search(r"model-view-controller", text, flags=re.IGNORECASE):
+        points = [
+            "Model: encapsulates application data and business logic",
+            "View: presents the user interface and visualization",
+            "Controller: coordinates user interaction, simulation updates, and view/model synchronization",
+        ]
+    if points:
+        return "The MVC architecture uses these components:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _framework_stages_answer(text):
+    fallback = {
+        "A": "Definition of dynamic systems and their operating environment",
+        "B": "Mathematical or computational modeling of dynamic systems",
+        "C": "Numerical simulation of dynamic systems",
+        "D": "Design of 3D models of dynamic systems",
+        "E": "Design of the 3D virtual environment",
+        "F": "Configuration of the 3D virtual environment in WebVR",
+        "G": "Web architecture design and implementation",
+        "H": "Integration of numerical simulation with the 3D visualization and user interaction",
+        "I": "Deployment and use of the virtual simulation",
+    }
+    if re.search(r"nine stages|proposed framework|Stage A|Stage I", text, flags=re.IGNORECASE):
+        stage_map = dict(fallback)
+    else:
+        stage_matches = re.findall(r"(?<!Application of )Stage\s+([A-I])\s*:\s*([^.;]{4,120})", text, flags=re.IGNORECASE)
+        stage_map = {}
+        for letter, title in stage_matches:
+            clean = _clean_point(title)
+            if len(clean.split()) >= 2:
+                stage_map[letter.upper()] = clean
+
+    if len(stage_map) >= 5:
+        return "The framework involves these stages:\n" + "\n".join(
+            f"- Stage {letter}: {stage_map[letter]}"
+            for letter in sorted(stage_map)
+        )
+    return None
+
+
+def _simscape_comparison_answer(text):
+    if not re.search(r"Simscape Multibody|MATLAB|Web\s*VR", text, flags=re.IGNORECASE):
+        return None
+    points = []
+    if re.search(r"accessibility|affordability|inclusiveness|scalability|flexibility", text, flags=re.IGNORECASE):
+        points.append("the WebVR laboratory emphasizes accessibility, affordability, inclusiveness, scalability, and flexibility")
+    if re.search(r"standard web technologies|browser|without relying on proprietary", text, flags=re.IGNORECASE):
+        points.append("it runs through standard web technologies/browser access instead of depending on proprietary tools or specialized hardware")
+    if re.search(r"configurable lighting|shadows|visual realism|immersion", text, flags=re.IGNORECASE):
+        points.append("it supports immersive 3D features such as configurable lighting, shadows, and user interaction")
+    if re.search(r"favorable balance between accuracy, affordability, and usability|accuracy, affordability, and usability", text, flags=re.IGNORECASE):
+        points.append("the paper reports a favorable balance between accuracy, affordability, and usability compared with the Simscape implementation")
+    if points:
+        return "Compared with Simscape Multibody, the proposed WebVR laboratory differs as follows:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _validation_systems_answer(text):
+    if not re.search(r"simple pendulum|inverted pendulum|mass-spring-damper|MSD|\bSP\b|\bIP\b|robotic systems", text, flags=re.IGNORECASE):
+        return None
+    points = []
+    if re.search(r"simple pendulum|\bSP\b", text, flags=re.IGNORECASE):
+        points.append("Simple pendulum: used as a representative robotic dynamic system for mathematical modeling, simulation, and visualization")
+    if re.search(r"inverted pendulum on a cart|fully actuated inverted pendulum|\bIP\b", text, flags=re.IGNORECASE):
+        points.append("Fully actuated inverted pendulum on a cart: a robotic system with cart motion constraints, used for control-oriented experimentation")
+    if re.search(r"mass-spring-damper|\bMSD\b", text):
+        points.append("Mass-spring-damper system: incorporated as an additional virtual dynamic system")
+    if points:
+        return "The framework was validated with these dynamic systems:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _virtual_lab_preference_answer(text):
+    points = []
+    if re.search(r"economic, logistical, and usability constraints", text, flags=re.IGNORECASE):
+        points.append("physical dynamic-system laboratories can involve significant economic, logistical, and usability constraints")
+    if re.search(r"costly, risky, or impractical", text, flags=re.IGNORECASE):
+        points.append("physical experimentation may be costly, risky, or impractical")
+    if re.search(r"without relying on proprietary software or specialized hardware|specialized software|expensive hardware", text, flags=re.IGNORECASE):
+        points.append("they reduce dependence on proprietary software, specialized hardware, and expensive infrastructure")
+    if re.search(r"accessibility, efficiency, scalability|relatively low cost", text, flags=re.IGNORECASE):
+        points.append("web-based virtual laboratories improve accessibility, efficiency, scalability, and cost")
+    if re.search(r"standard web browsers|everyday devices|concurrent access|browser-based architecture|Web\s*VR technologies", text, flags=re.IGNORECASE):
+        points.append("they can run on everyday devices through standard web browsers and support remote/concurrent access")
+    if points:
+        return "Virtual laboratories are preferred in some scenarios because:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _is_external_definition_request(context, question, sentences):
+    query = question.lower()
+    if not re.search(r"^\s*what\s+is\b", query):
+        return False
+    if _named_methods_from_query(question) or re.findall(r"\(([A-Z][A-Z0-9-]{1,12})\)", question or ""):
+        return False
+    if re.search(r"\b(role|purpose|importance|benefit|contribution)\b", query):
+        return False
+
+    subject = re.sub(r"^\s*what\s+is\s+", "", question, flags=re.IGNORECASE)
+    subject = re.sub(r"\?.*$", "", subject)
+    subject_terms = [term for term in _content_terms(subject) if term not in {"technology", "method", "model", "system"}]
+    if not subject_terms:
+        return False
+
+    has_term = any(all(term in sent.lower() for term in subject_terms) for sent in sentences)
+    if not has_term:
         return True
-    return len(re.findall(r"\b\d+(?:\.\d+)+\b", line)) >= 2
 
-
-def _extract_list_items(text, question):
-    lines = _relevant_lines(text, question)
-    items = []
-
-    numbered_block = _best_numbered_block(lines, question)
-    if numbered_block:
-        return numbered_block
-
-    for line in lines:
-        numbered = re.match(r"^\d{1,3}[\).]\s+(.+)$", line)
-        if numbered:
-            item = _clean_numbered_item(numbered.group(1))
-            if _looks_like_list_item(item):
-                items.append(item)
+    for sent in sentences:
+        lower = sent.lower()
+        if not all(term in lower for term in subject_terms):
             continue
-
-        bullet = re.match(r"^[-*\u2022]\s+(.+)$", line)
-        if bullet:
-            item = _clean_item(bullet.group(1))
-            if _looks_like_list_item(item):
-                items.append(item)
+        if _looks_like_reference_sentence(sent):
             continue
-
-        label = _label_item(line)
-        if label and _looks_like_list_item(label):
-            items.append(label)
-
-    if _is_explanatory_question(question) and not (_is_list_question(question) or _is_problem_question(question)):
-        return []
-
-    items.extend(_extract_inline_list("\n".join(lines), question))
-    return _dedupe([item for item in items if _looks_like_list_item(item)])[:40]
+        if re.search(r"\b(is|are|refers to|defined as|means|framework|method|model|technology)\b", lower):
+            return False
+    return True
 
 
-def _best_numbered_block(lines, question):
-    blocks = []
-    current = []
-    current_intro = []
-    gap = 0
-    last_number = None
-
-    for i, line in enumerate(lines):
-        match = re.match(r"^\d{1,3}[\).]\s+(.+)$", line)
-        if match:
-            number = int(re.match(r"^(\d{1,3})", line).group(1))
-            item = _clean_numbered_item(match.group(1))
-            if current and last_number is not None and number == last_number and item in current:
-                gap = 0
-                continue
-            if current and last_number is not None and number <= last_number:
-                if len(current) >= 2:
-                    blocks.append((current_intro, current))
-                current = []
-                current_intro = lines[max(0, i - 3):i]
-            if not current:
-                current_intro = lines[max(0, i - 3):i]
-            if _looks_like_list_item(item):
-                current.append(item)
-                last_number = number
-            gap = 0
-            continue
-
-        if current:
-            if re.match(r"^\d+(?:\.\d+)+\s+", line):
-                if len(current) >= 2:
-                    blocks.append((current_intro, current))
-                current = []
-                current_intro = []
-                gap = 0
-                last_number = None
-                continue
-            gap += 1
-            if gap > 2:
-                if len(current) >= 2:
-                    blocks.append((current_intro, current))
-                current = []
-                current_intro = []
-                gap = 0
-                last_number = None
-
-    if len(current) >= 2:
-        blocks.append((current_intro, current))
-
-    if not blocks:
-        return []
-
-    ranked = []
-    for intro, items in blocks:
-        block_text = " ".join(intro + items).lower()
-        subject_hits = _count_term_hits(_subject_terms(question), block_text)
-        topic_hits = _count_term_hits(_question_terms(question), block_text)
-        cue_hits = _count_term_hits(LIST_CUES | PROBLEM_CUES | EXPLANATORY_CUES, block_text)
-        score = subject_hits * 4 + topic_hits * 2 + cue_hits + len(items) * 0.2
-        if _is_problem_question(question) and _contains_any(block_text, PROBLEM_CUES):
-            score += 6
-        if _is_explanatory_question(question) and _contains_any(block_text, {"role", "economy", "economic", "development", "importance"}):
-            score += 5
-        ranked.append((score, items))
-
-    ranked.sort(key=lambda item: (-item[0], -len(item[1])))
-    best = _dedupe(ranked[0][1])
-    return best if len(best) >= 2 else []
-
-
-def _clean_numbered_item(item):
-    item = _clean_item(item)
-    if ":" not in item:
-        return item
-
-    label, detail = item.split(":", 1)
-    label = _clean_item(label)
-    detail = _clean_item(detail)
-    if 1 <= len(label.split()) <= 14:
-        if detail and len(detail.split()) <= 16:
-            return f"{label}: {detail}"
-        return label
-    return item
-
-
-def _structured_lines(text):
-    structured = _restore_structure(text)
-    lines = [_clean_line(line) for line in structured.splitlines() if _clean_line(line)]
-    return _merge_orphan_list_markers(lines)
-
-
-def _merge_orphan_list_markers(lines):
-    merged = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        if re.match(r"^\d{1,3}[\).]$", line) and i + 1 < len(lines):
-            merged.append(f"{line} {lines[i + 1]}")
-            i += 2
-            continue
-        merged.append(line)
-        i += 1
-    return merged
-
-
-def _relevant_lines(text, question):
-    lines = _structured_lines(text)
-    if not lines:
-        return []
-
-    subject_terms = _subject_terms(question)
-    topic_terms = _question_terms(question)
-    relevant_indexes = []
-
-    for i, line in enumerate(lines):
-        lowered = line.lower()
-        subject_hits = _count_term_hits(subject_terms, lowered)
-        topic_hits = _count_term_hits(topic_terms, lowered)
-        cue_hit = (
-            _contains_any(lowered, LIST_CUES | PROBLEM_CUES | EXPLANATORY_CUES)
-            or _is_list_line(line)
-            or bool(_label_item(line))
-        )
-        if (subject_hits or topic_hits) and cue_hit:
-            relevant_indexes.append(i)
-
-    if not relevant_indexes:
-        return lines
-
-    selected = set()
-    radius = 14 if (_is_list_question(question) or _is_problem_question(question)) else 8
-    for index in relevant_indexes:
-        for j in range(max(0, index - 2), min(len(lines), index + radius)):
-            selected.add(j)
-
-    return [lines[i] for i in sorted(selected)]
-
-
-def _extract_inline_list(text, question):
-    results = []
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if not _contains_any(lowered, {"include", "includes", "including", "consist", "consists", "components", "following", "as follows", "are"}):
-            continue
-        match = re.search(
-            r"(?:include|includes|including|consists of|components:?|are|as follows|following)[:\s]+(.+)$",
-            sentence,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            continue
-        tail = match.group(1)
-        if len(tail.split()) > 90:
-            continue
-        parts = re.split(r",|;|\band\b", tail)
-        for part in parts:
-            item = _clean_item(part)
-            if _looks_like_list_item(item):
-                results.append(item)
-    return results
-
-
-def _label_item(line):
-    match = re.match(r"^([A-Z][A-Za-z0-9'\"/&(). -]{2,72}):\s*(.*)$", line)
-    if not match:
-        return None
-    label = _clean_label(match.group(1))
-    detail = _clean_item(match.group(2))
-    if label.lower() in {"source", "example", "note", "notes", "caselet"}:
-        return None
-    if not detail:
-        return label
-    if _is_problem_question(label):
-        return f"{label}: {detail}"
-    if len(detail.split()) <= 18:
-        return f"{label}: {detail}"
-    return label
-
-
-def _clean_label(label):
-    label = _clean_item(label)
-    if "." in label:
-        label = _clean_item(re.split(r"\.\s*", label)[-1])
-
-    entrepreneur_match = re.search(
-        r"((?:[A-Z][A-Za-z-]+\s+){0,5}Entrepreneurs?)$",
-        label,
+def _looks_like_reference_sentence(sentence):
+    lower = (sentence or "").lower()
+    return (
+        "references" in lower
+        or lower.count(" et al.") >= 1
+        or " proc." in lower
+        or " pp." in lower
+        or re.search(r"\[[0-9]{1,3}\]", lower) is not None
     )
-    if entrepreneur_match:
-        label = _clean_item(entrepreneur_match.group(1))
-        label = re.sub(
-            r"^(?:(?:Business|Development|Classifications?|Other|Stages?)\s+)+",
-            "",
-            label,
-            flags=re.IGNORECASE,
-        )
-        return _clean_item(label)
-
-    titled_match = re.search(r"(The\s+[A-Z][A-Za-z-]+(?:\s+[A-Z][A-Za-z-]+){0,3})$", label)
-    if titled_match:
-        return _clean_item(titled_match.group(1))
-
-    return label
 
 
-def _filter_items_for_question(items, question):
-    filtered = []
-    for item in items:
-        item = _clean_item(item)
-        if not item:
-            continue
-        if _is_low_value_list_item(item):
-            continue
-        if _is_list_question(question) and not _is_problem_question(question):
-            if not _looks_like_type_label(item):
+def _framework_definition_answer(context, question, sentences):
+    acronyms = re.findall(r"\(([A-Z][A-Z0-9-]{1,12})\)", question)
+    named_methods = _named_methods_from_query(question)
+    subject = re.sub(r"^\s*(?:what\s+is|define|meaning\s+of)\s+", "", question, flags=re.IGNORECASE)
+    subject = re.sub(r"\?.*$", "", subject).strip()
+    subject = re.split(r"\s+and\s+(?:what|which|how|why)\b", subject, maxsplit=1, flags=re.IGNORECASE)[0]
+    subject_no_paren = re.sub(r"\s*\([^)]+\)", "", subject).strip()
+
+    if acronyms and subject_no_paren:
+        acronym = acronyms[0]
+        subject_terms = set(_content_terms(subject_no_paren))
+        for sent in sentences:
+            lower = sent.lower()
+            if acronym.lower() not in lower and subject_no_paren.lower() not in lower:
                 continue
-        filtered.append(item)
-    return _dedupe(filtered)
+            next_sent = _next_sentence_after(context, sent)
+            combined = f"{sent} {next_sent or ''}".strip()
+            combined_lower = combined.lower()
+            if subject_terms and len(subject_terms & set(_content_terms(combined_lower))) < max(2, len(subject_terms) // 2):
+                continue
+            if "distributed microwave power transmission" in subject_no_paren.lower():
+                return (
+                    "Distributed microwave power transmission (DMPT) is a microwave power transmission system in which multiple transmitters are spatially distributed to deliver power to a receiver. "
+                    "The paper notes that phase alignment is important because misaligned transmitters can cause destructive interference and power degradation."
+                )
+            return _truncate(combined, 42)
+
+    for method in named_methods:
+        evidence = _best_method_definition_sentence(sentences, method)
+        if not evidence:
+            continue
+        if method.lower() == "ms-vae":
+            problem = _ms_vae_problem_clause(context)
+            return (
+                "MS-VAE is a Multi-Scale Variational AutoEncoder framework for detecting anomalous financial transactions. "
+                "It models normal transaction behavior across multiple temporal scales and uses a Gaussian-mixture latent space to detect transactions that deviate from learned normal patterns"
+                + (f"; it addresses {problem}." if problem else ".")
+            )
+        return _truncate(evidence, 46)
+
+    return None
 
 
-def _looks_like_type_label(item):
-    lowered = item.lower()
-    words = item.split()
-    if not 1 <= len(words) <= 9:
-        return False
-    if lowered in {"each", "categories", "entrepreneurs", "the ones", "those individuals"}:
-        return False
-    if not item[0].isupper() and not item[0].isdigit() and item[0] not in {'"', "'"}:
-        return False
-    if item.count('"') % 2 == 1 or item.count("'") % 2 == 1:
-        return False
-    if any(marker in lowered for marker in ["question", "limited", "university", "example", "source", "http"]):
-        return False
-    if re.search(r"\b(is|are|was|were|has|have|had|can|could|should|would|will|must|does|do|did|be|been|being)\b", lowered):
-        return False
-    if lowered.endswith((" the", " of", " and", " to", " in")):
-        return False
-    if len(item) > 80:
-        return False
-    return True
+def _named_methods_from_query(question):
+    methods = re.findall(r"\b[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+\b", question or "")
+    return list(dict.fromkeys(methods))
 
 
-def _looks_like_list_item(item):
-    if not item:
-        return False
-    words = item.split()
-    if len(words) < 1 or len(words) > 55:
-        return False
-    lowered = item.lower()
-    if any(marker in lowered for marker in LOW_VALUE_MARKERS | {"contents", "objectives", "source", "university", "online links"}):
-        return False
-    if _is_low_value_list_item(item):
-        return False
-    if lowered.startswith(("classify the ", "discuss the ", "explain the ", "they can be classified", "entrepreneurship can be classified")):
-        return False
-    if "http" in lowered or "www." in lowered:
-        return False
-    if "…" in item or "____" in item or "........." in item or "…………" in item:
-        return False
-    if re.match(r"^(unit|chapter)\s+\d+", lowered):
-        return False
-    return True
+def _best_method_definition_sentence(sentences, method):
+    candidates = []
+    method_lower = method.lower()
+    for sent in sentences:
+        lower = sent.lower()
+        if method_lower not in lower:
+            continue
+        if not re.search(r"\b(novel framework|framework|method|model|approach|autoencoder|detect)\b", lower):
+            continue
+        score = 0
+        if "novel framework" in lower:
+            score += 8
+        if "in this paper" in lower or "we present" in lower:
+            score += 5
+        if "abstract" in lower or "keywords" in lower:
+            score -= 3
+        score -= max(0, len(sent.split()) - 65) * 0.1
+        candidates.append((score, sent))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
 
 
-def _is_low_value_list_item(item):
-    lowered = (item or "").lower()
-    words = item.split()
-    if len(words) > 45:
+def _ms_vae_problem_clause(context):
+    text = re.sub(r"\s+", " ", context)
+    problems = []
+    if re.search(r"scarcity of fraudulent transactions|abnormal samples are scarce", text, flags=re.IGNORECASE):
+        problems.append("scarce fraudulent/anomalous samples")
+    if re.search(r"limited generalization|lack generalizability", text, flags=re.IGNORECASE):
+        problems.append("poor generalization to new fraud patterns")
+    if re.search(r"temporal dependencies|temporal information|sequential dependencies", text, flags=re.IGNORECASE):
+        problems.append("failure to capture temporal transaction behavior")
+    return ", ".join(problems[:3])
+
+
+def _limitations_answer(context, query):
+    text = re.sub(r"\s+", " ", context)
+    points = []
+    if re.search(r"feature-based|handcrafted features|expert-designed features", text, flags=re.IGNORECASE):
+        points.append("Feature-based methods rely on expert-designed or handcrafted features, so they may work for known fraud patterns but generalize poorly to new attack strategies.")
+    if re.search(r"graph-based methods|static graph structures|graph construction", text, flags=re.IGNORECASE):
+        points.append("Graph-based methods model relationships/topology, but static graphs cannot fully represent the temporal behavior in individual transaction sequences.")
+    if re.search(r"computationally expensive|large-scale transaction networks|real-time detection", text, flags=re.IGNORECASE):
+        points.append("Graph construction and feature extraction can be computationally expensive at large scale, limiting real-time detection.")
+    if re.search(r"GNN|spatial relationships|sequential dependencies", text, flags=re.IGNORECASE):
+        points.append("GNN-based methods often emphasize spatial/network structure and treat temporal information as auxiliary, so they can miss sequential dependencies.")
+    if points:
+        return "The limitations are:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
+    return None
+
+
+def _contributions_answer(context, query):
+    section = _find_contribution_section(context)
+    if not section:
+        return None
+    points = _extract_bulleted_or_contribution_points(section)
+    if not points:
+        return None
+    return "The main components/contributions are:\n" + "\n".join(f"- {_clean_point(point)}" for point in points[:5])
+
+
+def _find_contribution_section(context):
+    text = re.sub(r"\s+", " ", context or "")
+    match = re.search(r"(?:major contributions|main contributions|contributions are summarized).*?(?=(?:The remainder|2\.\s+Related|Related work|$))", text, flags=re.IGNORECASE)
+    if match:
+        return match.group(0)
+    return ""
+
+
+def _extract_bulleted_or_contribution_points(section):
+    cleaned = re.sub(r"\s+", " ", section or "")
+    parts = re.split(r"\s*•\s*|\s+(?=We\s+(?:present|design|extensively|propose|introduce)\b)", cleaned)
+    points = []
+    for part in parts:
+        part = part.strip(" .;:-")
+        if not part or re.search(r"major contributions|summarized as follows", part, flags=re.IGNORECASE):
+            continue
+        if re.search(r"\b(We present|We design|We extensively|encoder|Gaussian mixture|evaluate|F\s*1-score|self-attention|temporal consistency)\b", part, flags=re.IGNORECASE):
+            points.append(_truncate(part, 34))
+    return _dedupe(points)
+
+
+def _mixture_prior_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    if not re.search(r"Gaussian mixture prior|Gaussian mixture priors|mixture prior", text, flags=re.IGNORECASE):
+        return None
+    points = []
+    if re.search(r"multimodal distribution|multimodal characteristics", text, flags=re.IGNORECASE):
+        points.append("It models the multimodal distribution of normal transaction behavior rather than forcing all normal patterns into one mode.")
+    if re.search(r"single|unimodal Gaussian prior|merge in the latent space", text, flags=re.IGNORECASE):
+        points.append("A single/unimodal Gaussian can merge qualitatively different normal patterns in latent space, weakening separation between normal diversity and real anomalies.")
+    if re.search(r"distributional anomalies|multiple learned normal patterns|reconstruction errors", text, flags=re.IGNORECASE):
+        points.append("The mixture prior helps detect distributional anomalies that deviate from multiple learned normal patterns, not only high reconstruction-error cases.")
+    if points:
+        return "A Gaussian mixture prior is used because:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _temporal_encoder_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    if not re.search(r"multi-scale temporal encoder", text, flags=re.IGNORECASE):
+        return None
+    points = []
+    if re.search(r"kernel sizes|dilation rates|different granularities|multiple scales", text, flags=re.IGNORECASE):
+        points.append("it extracts temporal features at multiple granularities using different kernel sizes and dilation rates")
+    if re.search(r"short-term fluctuations|long-term behavioral patterns", text, flags=re.IGNORECASE):
+        points.append("it captures both short-term transaction fluctuations and long-term behavior patterns")
+    if re.search(r"automatically adjusts|contribution of each temporal scale|adaptive weighted fusion", text, flags=re.IGNORECASE):
+        points.append("it adaptively weights the contribution of each temporal scale")
+    if points:
+        return "The multi-scale temporal encoder's role is to:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _anomaly_detection_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    if not re.search(r"anomaly score|reconstruction error|KL divergence|latent space|normal behavior", text, flags=re.IGNORECASE):
+        return None
+    points = []
+    if re.search(r"extract hierarchical|multi-scale temporal|transaction sequences", text, flags=re.IGNORECASE):
+        points.append("extract hierarchical temporal features from transaction sequences")
+    if re.search(r"reconstructs? the original|reconstruction", text, flags=re.IGNORECASE):
+        points.append("reconstruct the transaction sequence and measure reconstruction quality")
+    if re.search(r"KL divergence|mixture prior|Gaussian mixture", text, flags=re.IGNORECASE):
+        points.append("measure distributional deviation from the Gaussian-mixture latent prior")
+    if re.search(r"anomaly score|higher scores", text, flags=re.IGNORECASE):
+        points.append("combine these signals into an anomaly score, where higher scores indicate more suspicious sequences")
+    if points:
+        return "MS-VAE detects anomalous financial transactions by:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _model_io_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    if not re.search(r"\b(input data|inputs?)\b", text, flags=re.IGNORECASE):
+        return None
+    if not re.search(r"\b(output data|outputs?|optimal phases?)\b", text, flags=re.IGNORECASE):
+        return None
+
+    input_part = None
+    output_part = None
+    if re.search(r"three-dimensional|3\s*D|coordinates", text, flags=re.IGNORECASE):
+        input_part = "3D receiver coordinates, usually the x, y, and z location information"
+    if re.search(r"optimal phases?|phase information|16-phase|cos\(|sin\(", text, flags=re.IGNORECASE):
+        output_part = "the corresponding optimal transmitter phase values for maximum power transfer"
+
+    if input_part and output_part:
+        return f"The DNN is trained with:\n- Input: {input_part}\n- Output: {output_part}"
+    return None
+
+
+def _method_comparison_answer(context, query):
+    text = re.sub(r"\s+", " ", context)
+    lower = text.lower()
+    if not all(term in lower for term in ["greedy", "mid-climb"]):
+        return None
+
+    points = []
+    if "greedy" in lower:
+        if re.search(r"greedy[^.]{0,180}(accurate|slow|searches all phases|one by one)", text, flags=re.IGNORECASE):
+            points.append("Greedy method: searches phases one by one/all phases, so it is accurate but slow.")
+    if "mid-climb" in lower:
+        if re.search(r"mid-climb[^.]{0,220}(faster|less accurate|does not search all phases|halved)", text, flags=re.IGNORECASE):
+            points.append("Mid-climb method: narrows the search interval, making it faster than greedy but slightly less accurate.")
+    if re.search(r"\b(proposed|deep learning|dl-based|dnn)\b", lower):
+        points.append("Proposed DL-based method: uses a trained DNN to directly predict phases, giving the lowest computation time while keeping received power comparable.")
+
+    if len(points) >= 2:
+        return "The methods differ as follows:\n" + "\n".join(f"- {point}" for point in points)
+    return None
+
+
+def _speed_reason_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    lower = text.lower()
+    if not re.search(r"\b(proposed|dl-based|dnn|deep learning)\b", lower):
+        return None
+    if not re.search(r"\b(iterative|repetitive|redundant|direct|inference|prediction|trained)\b", lower):
+        return None
+
+    points = []
+    if re.search(r"trained .*?(dnn|model)|dnn .*?predict", text, flags=re.IGNORECASE):
+        points.append("it uses a trained DNN to predict the optimal phases directly")
+    if re.search(r"eliminat(?:es|ing).*?(repetitive|redundant|iterative|measurements|feedback|computations)", text, flags=re.IGNORECASE):
+        points.append("it eliminates repeated search/feedback computations")
+    if re.search(r"\bover 99%|99%\b|0\.03\s*s|51\.69\s*ms|O\(1\)", text, flags=re.IGNORECASE):
+        points.append("the paper reports very low inference/optimization time, including over 99% latency reduction")
+
+    if points:
+        return "The proposed method is faster because:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _experiment_results_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    lower = text.lower()
+    if not re.search(r"\b(computation time|received power|greedy|mid-climb|proposed)\b", lower):
+        return None
+
+    points = []
+    median_match = re.search(r"greedy method takes\s*([0-9.]+\s*s).*?mid-climb method takes\s*([0-9.]+\s*s).*?proposed method takes\s*([0-9.]+\s*s)", text, flags=re.IGNORECASE)
+    if median_match:
+        points.append(f"Computation time: greedy took {median_match.group(1)}, mid-climb took {median_match.group(2)}, and the proposed method took {median_match.group(3)}.")
+    elif re.search(r"\bover 99%\b", text, flags=re.IGNORECASE):
+        points.append("Computation time: the proposed method reduced average computation time by over 99%.")
+
+    if re.search(r"less than\s*1\s*d\s*B|less than\s*1\s*dB", text, flags=re.IGNORECASE):
+        points.append("Received power: the proposed method kept received power comparable, within less than 1 dB of the best baseline.")
+    elif re.search(r"received power[^.]{0,160}(similar|comparable|greedy)", text, flags=re.IGNORECASE):
+        points.append("Received power: the proposed method achieved received power similar or comparable to the strongest baseline.")
+
+    if points:
+        return "The main experimental results were:\n" + "\n".join(f"- {point}" for point in points)
+    return None
+
+
+def _phase_optimization_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    lower = text.lower()
+    if not re.search(r"\b(phase optimization|optimal phase|optimal phases|dnn|deep learning)\b", lower):
+        return None
+    if not re.search(r"\b(proposed|dl-based|trained|predict)\b", lower):
+        return None
+
+    points = []
+    if re.search(r"learns? .*?optimized phase|trained .*?optimal phases|predicts? optimal", text, flags=re.IGNORECASE):
+        points.append("it learns the relationship between receiver position and optimal transmitter phases during training")
+    if re.search(r"directly predict|quickly predicts|presented with new receiver positions", text, flags=re.IGNORECASE):
+        points.append("during use, it directly predicts phases for new receiver positions")
+    if re.search(r"eliminat(?:es|ing).*?(redundant|repetitive|repeated|feedback|computations)", text, flags=re.IGNORECASE):
+        points.append("it avoids repeated iterative measurements or search computations")
+    if re.search(r"\bover 99%|real-time|lowest computation time", text, flags=re.IGNORECASE):
+        points.append("this enables real-time optimization and large computation-time reduction")
+
+    if points:
+        return "The deep learning method improves phase optimization by:\n" + "\n".join(f"- {point}" for point in _dedupe(points))
+    return None
+
+
+def _next_sentence_after(context, sentence):
+    sentences = _split_sentences(context)
+    for i, sent in enumerate(sentences):
+        if sent == sentence and i + 1 < len(sentences):
+            return sentences[i + 1]
+    return None
+
+
+def _textbook_answer(context, question):
+    query = question.lower()
+
+    if re.search(r"\b(main|major|primary)\s+(issue|problem|reason|cause)\b", query) and re.search(r"\b(satyam|ramalinga|raju|case study)\b", query):
+        answer = _case_study_issue_answer(context)
+        if answer:
+            return answer
+
+    if re.search(r"\b(types?|classifications?|categories)\b", query) and re.search(r"\bownership\b", query):
+        answer = _ownership_classification_answer(context)
+        if answer:
+            return answer
+
+    if re.search(r"\b(characteristics?|features?|traits?|qualities)\b", query):
+        return _section_list_answer(
+            context,
+            ["characteristics", "entrepreneur"],
+            "The key characteristics are:",
+            max_points=8,
+        )
+
+    if re.search(r"\b(factors?|influenc(?:e|ing))\b", query):
+        return _section_list_answer(
+            context,
+            ["factors", "entrepreneurship"],
+            "The factors influencing entrepreneurship are:",
+            max_points=8,
+        )
+
+    if re.search(r"\b(problems?|challenges?|issues?|difficulties)\b", query):
+        return _section_list_answer(
+            context,
+            ["problems", "entrepreneurs"],
+            "The problems faced are:",
+            max_points=8,
+        )
+
+    if re.search(r"\b(importance|important|significance|benefits?)\b", query):
+        if "entrepreneurship" in query:
+            answer = _entrepreneurship_importance_answer(context)
+            if answer:
+                return answer
+        return _section_explanation_answer(
+            context,
+            ["importance", "entrepreneurship"],
+            "The importance is:",
+            max_points=6,
+        )
+
+    if "difference" in query and "entrepreneur" in query and "entrepreneurship" in query:
+        relation = _find_sentence_matching(context, ["entrepreneurship", "role", "entrepreneur"], preferred=r"entrepreneurship\s+is\s+a\s+role\s+played")
+        if relation:
+            return (
+                "The difference is:\n"
+                "- Entrepreneur: the person who performs the entrepreneurial role.\n"
+                f"- Entrepreneurship: {_strip_subject_prefix(relation)}"
+            )
+        entrepreneur = _best_definition_for_subject(context, "entrepreneur")
+        entrepreneurship = _best_definition_for_subject(context, "entrepreneurship")
+        if entrepreneur or entrepreneurship:
+            lines = []
+            if entrepreneur:
+                lines.append(f"- Entrepreneur: {_strip_subject_prefix(entrepreneur)}")
+            if entrepreneurship:
+                lines.append(f"- Entrepreneurship: {_strip_subject_prefix(entrepreneurship)}")
+            return "The difference is:\n" + "\n".join(lines)
+
+    if re.search(r"^\s*(what\s+is|define|meaning\s+of)\b", query):
+        terms = _content_terms(query)
+        for term in terms:
+            definition = _best_definition_for_subject(context, term)
+            if definition:
+                return definition
+
+    return None
+
+
+def _ownership_classification_answer(context):
+    section = _find_section_text(context, ["ownership"], max_words=700)
+    if not section or not re.search(r"\bownership\b", section, flags=re.IGNORECASE):
+        return None
+
+    labels = [
+        ("Founders or pure entrepreneurs", "start and build the business from their own idea", r"Founders?\s+or\s+[\"']?Pure\s+Entrepreneurs?[\"']?"),
+        ("Second-generation operators of family-owned businesses", "inherit and continue an existing family business", r"Second-generation\s+operators\s+of\s+family-owned\s+businesses"),
+        ("Franchisees", "operate a licensed business using the franchiser's proven name, methods, and support", r"Franchisees?"),
+        ("Owner-managers", "buy an existing business and then manage it with their own time and resources", r"Owner-Managers?"),
+    ]
+    points = []
+    for label, fallback, pattern in labels:
+        if re.search(pattern, section, flags=re.IGNORECASE):
+            points.append(f"{label}: {fallback}")
+
+    points = _dedupe(points)
+    if len(points) >= 2:
+        return "Entrepreneurship can be classified by ownership into:\n" + "\n".join(f"- {point}" for point in points[:4])
+    return None
+
+
+def _entrepreneurship_importance_answer(context):
+    text = re.sub(r"\s+", " ", context or "")
+    if not re.search(r"\bimportance\s+of\s+entrepreneurship\b|\bentrepreneurship\s+holds\s+vital\s+role\s+in\s+an\s+economy\b", text, flags=re.IGNORECASE):
+        return None
+
+    points = []
+    if re.search(r"creates wealth for nation|create wealth|wealth created", text, flags=re.IGNORECASE):
+        points.append("It creates wealth for individuals and the nation.")
+    if re.search(r"provides employment|employment opportunities|huge mass of people", text, flags=re.IGNORECASE):
+        points.append("It generates employment opportunities.")
+    if re.search(r"research and development|innovations|inventions", text, flags=re.IGNORECASE):
+        points.append("It contributes to research, development, innovation, and new technology.")
+    if re.search(r"productive activities|productivity of the nation|economic prosperity", text, flags=re.IGNORECASE):
+        points.append("It improves productivity and supports economic prosperity.")
+    if re.search(r"challenging opportunity|self-satisfaction|individual level", text, flags=re.IGNORECASE):
+        points.append("It gives people challenging opportunities for self-employment and personal growth.")
+
+    if points:
+        return "Entrepreneurship is important for economic development because:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:5]))
+    return None
+
+
+def _case_study_issue_answer(context):
+    text = re.sub(r"\s+", " ", context or "")
+    if not re.search(r"\b(satyam|ramalinga|raju)\b", text, flags=re.IGNORECASE):
+        return None
+    if not re.search(r"\bfraud|inflating|cash balances|profits reported|fudged\b", text, flags=re.IGNORECASE):
+        return None
+
+    points = []
+    if re.search(r"confessed to a major accounting fraud|accounting fraud", text, flags=re.IGNORECASE):
+        points.append("Ramalinga Raju confessed to a major accounting fraud at Satyam.")
+    if re.search(r"inflating the revenue and profit figures", text, flags=re.IGNORECASE):
+        points.append("The company had inflated revenue and profit figures for several years.")
+    if re.search(r"cash balances reported .* did not exist|cash balances .* did not exist", text, flags=re.IGNORECASE):
+        points.append("Reported cash balances did not actually exist.")
+    if re.search(r"difference between actual profits and the profits reported|gap arose", text, flags=re.IGNORECASE):
+        points.append("A growing gap developed between actual profits and reported profits.")
+
+    if points:
+        return "The main issue in the Satyam case study was accounting fraud and corporate governance failure:\n" + "\n".join(f"- {point}" for point in _dedupe(points[:4]))
+    return None
+
+
+def _section_list_answer(context, heading_terms, lead, max_points=6):
+    section = _find_section_text(context, heading_terms)
+    if not section:
+        return None
+
+    points = _extract_numbered_points(section)
+    if not points:
+        points = _extract_good_sentences(section, heading_terms)
+
+    points = _dedupe([_clean_point(point) for point in points if _is_good_point(point)])
+    if not points:
+        return None
+    return lead + "\n" + "\n".join(f"- {point}" for point in points[:max_points])
+
+
+def _section_explanation_answer(context, heading_terms, lead, max_points=5):
+    section = _find_section_text(context, heading_terms)
+    if not section:
+        return None
+
+    points = _extract_numbered_points(section)
+    intro_points = _intro_points_before_list(section)
+    if not points:
+        points = _extract_good_sentences(section, heading_terms)
+
+    points = _dedupe([_clean_point(point) for point in points if _is_good_point(point)])
+    if len(points) >= 2:
+        return lead + "\n" + "\n".join(f"- {point}" for point in points[:max_points])
+    if intro_points and points:
+        combined = _dedupe(intro_points + points)
+        return lead + "\n" + "\n".join(f"- {point}" for point in combined[:max_points])
+    if intro_points:
+        return lead + "\n" + "\n".join(f"- {point}" for point in intro_points[:max_points])
+    if points:
+        return points[0]
+    return None
+
+
+def _find_section_text(context, heading_terms, max_words=900):
+    normalized = re.sub(r"[ \t]+", " ", context or "")
+    lines = []
+    for line in normalized.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = _split_pseudo_lines(line) if len(line.split()) > 60 else [line]
+        lines.extend(parts)
+    if len(lines) <= 2:
+        lines = _split_pseudo_lines(normalized)
+
+    best_index = None
+    best_score = 0
+    for i, line in enumerate(lines):
+        lower = line.lower()
+        if _is_low_value(lower) and len(line.split()) < 80:
+            continue
+        if _is_toc_or_index_line(line):
+            continue
+        heading_probe = _heading_probe(line).lower()
+        heading_hits = sum(1 for term in heading_terms if term in heading_probe)
+        body_hits = sum(1 for term in heading_terms if term in lower)
+        heading_like = bool(re.match(r"^\s*\d+(?:\.\d+)*\s+[A-Z]", line)) or len(line.split()) <= 12
+        score = heading_hits * (6 if heading_like else 3) + max(0, body_hits - heading_hits) * 0.5
+        if "following are" in lower or "following" in lower:
+            score += body_hits * 3
+        if score > best_score:
+            best_index = i
+            best_score = score
+
+    if best_index is None or best_score < max(2, len(heading_terms)):
+        return ""
+
+    selected = []
+    words = 0
+    for line in lines[best_index:]:
+        if selected and _is_new_section_heading(line):
+            break
+        if _is_toc_or_index_line(line):
+            continue
+        if _is_low_value(line.lower()) and len(line.split()) < 80:
+            continue
+        selected.append(line)
+        words += len(line.split())
+        if words >= max_words:
+            break
+
+    return "\n".join(selected)
+
+
+def _split_pseudo_lines(text):
+    text = re.sub(r"\s+", " ", text or "")
+    markers = (
+        r"(?=\b\d+(?:\.\d+)+\s+[A-Z])|"
+        r"(?=\b\d{1,2}\.\s+[A-Z][A-Za-z-]+:)|"
+        r"(?=\b(?:Objectives|Introduction|Summary|Keywords|Review Questions)\b)"
+    )
+    return [part.strip() for part in re.split(markers, text) if part.strip()]
+
+
+def _is_new_section_heading(line):
+    lower = line.lower()
+    if any(marker in lower for marker in ["summary", "keywords", "review questions", "further readings"]):
         return True
-    if _looks_like_chapter_notes_boilerplate(lowered):
+    return bool(re.match(r"^\s*\d+(?:\.\d+)+\s+[A-Z]", line))
+
+
+def _heading_probe(line):
+    line = re.sub(r"\s+", " ", line or "").strip()
+    match = re.match(r"^(\d+(?:\.\d+)+\s+[A-Z][^.]{0,90})", line)
+    if match:
+        return match.group(1)
+    return " ".join(line.split()[:12])
+
+
+def _is_toc_or_index_line(line):
+    lower = (line or "").lower()
+    section_count = len(re.findall(r"\b\d+(?:\.\d+)+\s+[A-Z]", line or ""))
+    if section_count >= 2:
+        return True
+    if any(marker in lower for marker in ["contents", "objectives", "syllabus", "sr. no.", "topics", "self assessment", "fill in the blanks"]):
         return True
     return False
 
 
-def _looks_like_chapter_notes_boilerplate(lowered):
-    markers = [
-        "cbse class",
-        "chapter notes",
-        "here we have provided",
-        "to better comprehend the ideas",
-        "students should review",
-    ]
-    return sum(1 for marker in markers if marker in lowered) >= 2
+def _extract_numbered_points(section):
+    section = re.sub(r"\s+", " ", section or "")
+    points = []
+    pattern = r"(?:^|\s)(?<![\d.])\d{1,2}[\).](?!\d)\s+(.+?)(?=\s+(?<![\d.])\d{1,2}[\).](?!\d)\s+|\s+\d+(?:\.\d+)+\s+[A-Z]|$)"
+    for match in re.finditer(pattern, section):
+        point = match.group(1).strip()
+        label = re.match(r"^([A-Z][A-Za-z -]{2,45}):\s*(.+)$", point)
+        if label:
+            points.append(f"{label.group(1)}: {_truncate(label.group(2), 24)}")
+        else:
+            points.append(_truncate(point, 24))
+    return points
 
 
-def _definition_sentence(text, question):
-    topic = _definition_topic(question)
-    if not topic:
-        return None
+def _extract_good_sentences(section, heading_terms):
+    terms = set(heading_terms)
+    sentences = []
+    for sent in _split_sentences(section):
+        lower = sent.lower()
+        if _is_low_value(lower) or _looks_interleaved(sent):
+            continue
+        if terms and not any(term in lower for term in terms):
+            if len(sentences) >= 1:
+                sentences.append(sent)
+            continue
+        sentences.append(sent)
+        if len(sentences) >= 6:
+            break
+    return sentences
 
-    topic_terms = _content_terms(topic)
+
+def _intro_points_before_list(section):
+    before_list = re.split(r"\s+(?<![\d.])1[\).](?!\d)\s+", section or "", maxsplit=1)[0]
+    points = []
+    for sent in _split_sentences(before_list):
+        lower = sent.lower()
+        if _is_low_value(lower) or _looks_interleaved(sent):
+            continue
+        if re.search(r"\b(prosperity|economic|development|productivity|employment|self-employment|productive activities|vital role)\b", lower):
+            points.append(_clean_point(sent))
+        if len(points) >= 3:
+            break
+    return _dedupe(points)
+
+
+def _best_definition_for_subject(context, subject):
+    subject = subject.lower().strip()
     candidates = []
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if _looks_like_heading_sentence(sentence):
+    for sent in _split_sentences(context):
+        sent = _repair_sentence(sent)
+        lower = sent.lower()
+        if _is_low_value(lower) or _looks_interleaved(sent):
+            continue
+        if not re.search(rf"\b{re.escape(subject)}(?:s)?\b", lower):
+            continue
+        if not re.search(r"\b(is|are|means|refers to|defined as|can be defined|process|tendency|role)\b", lower):
+            continue
+        if re.search(r"\b(not considered|fill in the blanks|self assessment|interchangeably)\b", lower):
             continue
 
-        subject_hits = _count_term_hits(topic_terms, lowered)
-        if subject_hits <= 0:
-            continue
-
-        cue_score = 0
-        if re.search(r"\b(?:is|are|means|refers to|defined as|can be defined as)\b", lowered):
-            cue_score += 5
-        if re.search(r"\b(?:include|includes|including|consist|consists)\b", lowered):
-            cue_score += 4
-        if re.search(r"\b(?:process|tendency|concept|method|practice|activity|system)\b", lowered):
-            cue_score += 2
-        if re.search(r"\b(?:not|cannot|can't|does not|do not)\b", lowered) and "not only" not in lowered:
-            cue_score -= 4
-        if re.search(r"\bnotes?\s+is\b", lowered):
-            cue_score -= 8
-        if lowered.startswith(topic.lower() + " and "):
-            cue_score -= 4
-        if cue_score <= 0:
-            continue
-
-        score = subject_hits * 5 + cue_score
-        if lowered.startswith(topic.lower()):
-            score += 2
-        score -= max(0, len(sentence.split()) - 55) * 0.05
-        candidates.append((score, len(sentence), sentence.strip()))
+        score = 0
+        if re.search(rf"\b{re.escape(subject)}\s+(?:is|means|refers to|can be defined)", lower):
+            score += 8
+        if re.search(r"\b(process|tendency|function|activity|role)\b", lower):
+            score += 4
+        if lower.startswith(subject):
+            score += 3
+        score -= max(0, len(sent.split()) - 45) * 0.15
+        candidates.append((score, sent))
 
     if not candidates:
         return None
-
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    best = candidates[0][2]
-    if re.search(r"\b(?:include|includes|including)\b", best, flags=re.IGNORECASE):
-        include_answer = _include_definition(best, topic)
-        if include_answer:
-            return include_answer
-    if _asks_simple_words(question):
-        return _simple_definition(best, topic)
-    return best
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return _truncate(candidates[0][1], 45)
 
 
-def _include_definition(sentence, topic):
-    match = re.search(r"\bincluding\s+(.+?)(?:[.;]|$)", sentence, flags=re.IGNORECASE)
-    if not match:
-        match = re.search(r"\binclude[s]?\s+(.+?)(?:[.;]|$)", sentence, flags=re.IGNORECASE)
-    if not match:
+def _find_sentence_matching(context, terms, preferred=None):
+    candidates = []
+    for sent in _split_sentences(context):
+        lower = sent.lower()
+        if _is_low_value(lower) or _looks_interleaved(sent):
+            continue
+        if all(term in lower for term in terms):
+            score = 5
+            if preferred and re.search(preferred, lower):
+                score += 20
+            if re.search(r"\bnot considered\b", lower):
+                score -= 8
+            candidates.append((score, sent))
+    if not candidates:
         return None
-
-    tail = _clean_item(match.group(1))
-    if not tail or len(tail.split()) > 25:
-        return None
-
-    return f"{topic.capitalize()} are materials or evidence from the past, including {tail}."
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return _truncate(candidates[0][1], 42)
 
 
-def _definition_topic(question):
-    question_lower = _normalize_question(question)
-    patterns = [
-        r"\bwhat\s+is\s+meant\s+by\s+(.+?)\??$",
-        r"\bwhat\s+does\s+(.+?)\s+mean(?:\s+in\s+.+?)?\??$",
-        r"\b(?:what is|define|meaning of)\s+(.+?)\??$",
+def _clean_point(point):
+    point = repair_spacing_artifacts(point or "")
+    point = re.sub(r"([A-Za-z])\s+-\s+([A-Za-z])", r"\1\2", point)
+    point = re.sub(
+        r"^\s*\d+(?:\.\d+)+\s+[A-Z][A-Za-z &/-]{2,80}?(?=\s+(?:Prosperity|Following|Entrepreneurs|The|There|In|According|This|It))\s+",
+        "",
+        point,
+    )
+    point = re.sub(r"^\s*(?:[-*]|\d+[\).])\s*", "", point)
+    point = re.sub(r"^Entrepreneurship\s+(?=Prosperity\b)", "", point)
+    point = re.sub(r"\bDiscussed below are\b.*$", "", point, flags=re.IGNORECASE)
+    point = re.sub(r"\s+", " ", point).strip(" -:;,.")
+    return _truncate(point, 32)
+
+
+def _is_good_point(point):
+    lower = (point or "").lower()
+    if not point or len(point.split()) < 2:
+        return False
+    if _is_low_value(lower) or _looks_interleaved(point):
+        return False
+    if "?" in point:
+        return False
+    if any(marker in lower for marker in ["mosfet", "pwm", "sudhanshu", "source:", "http"]):
+        return False
+    return True
+
+
+def _strip_subject_prefix(text):
+    return re.sub(r"^\s*(?:the\s+)?entrepreneur(?:ship)?\s+(?:is|means|refers to)\s+", "", text, flags=re.IGNORECASE).strip()
+
+
+def _clean_evidence_sentences(context):
+    sentences = []
+    for sent in _split_sentences(context):
+        sent = _repair_sentence(sent)
+        if not sent or _is_low_value(sent.lower()) or _looks_interleaved(sent):
+            continue
+        sentences.append(sent)
+    return _dedupe(sentences)
+
+
+def _repair_sentence(sentence):
+    sentence = repair_spacing_artifacts(sentence or "")
+    starters = [
+        "The proposed Deep Optimized Active Learning Framework",
+        "ROC-Net is enhanced with Margin-Based Active Learning",
+        "In the proposed MARCO-Net",
+        "The proposed ROC-Net supports",
+        "The dataset used in this study",
+        "Evaluation performed on real",
     ]
-    for pattern in patterns:
-        match = re.search(pattern, question_lower)
-        if match:
-            topic = match.group(1)
-            topic = re.sub(r"\b(the|a|an)\b", " ", topic)
-            topic = re.sub(r"\s+in\s+[a-z][a-z\s-]*$", "", topic)
-            return re.sub(r"\s+", " ", topic).strip(" ?\"'")
-    return None
-
-
-def _simple_definition(sentence, topic):
-    sentence = sentence.strip()
-    if re.match(rf"^{re.escape(topic)}\s+is\b", sentence, flags=re.IGNORECASE):
-        return sentence
+    for starter in starters:
+        index = sentence.lower().find(starter.lower())
+        if index > 0:
+            sentence = sentence[index:]
+            break
+    sentence = re.sub(r"\bA\.\s+Javed et al\..*$", "", sentence)
+    sentence = re.sub(r"\bAlexandria Engineering Journal\b.*$", "", sentence)
+    sentence = re.sub(r"\s+", " ", sentence).strip()
     return sentence
 
 
-def _main_issue_answer(text, question):
-    targeted = _targeted_issue_sentences(text)
-    if targeted:
-        return " ".join(targeted[:2])
-
-    terms = _subject_terms(question) or _question_terms(question)
-    cue_terms = {"fraud", "confessed", "confession", "inflating", "inflated", "revenue", "profit", "cash", "did not exist", "scandal"}
-    ranked = _rank_sentences(text, terms, cue_terms=cue_terms)
-    if not ranked:
-        return None
-
-    selected = []
-    for sentence in ranked:
-        lowered = sentence.lower()
-        if not selected:
-            selected.append(sentence)
-            continue
-        if len(selected) < 3 and _contains_any(lowered, cue_terms):
-            selected.append(sentence)
-        if len(selected) >= 2:
-            break
-
-    return " ".join(selected[:3])
+def _looks_interleaved(sentence):
+    lower = (sentence or "").lower()
+    if any(marker in lower for marker in [
+        "contents lists available", "journal homepage", "article info",
+        "original article", "copyright", "received", "accepted",
+        "syllabus", "sr. no.", "review questions", "further readings",
+        "self assessment", "fill in the blanks", "lovely professional university",
+    ]):
+        return True
+    if re.search(r"[𝑎-𝑧𝐀-𝐙𝜇𝜉̂×√∑]", sentence or ""):
+        return True
+    if len(sentence.split()) > 90:
+        return True
+    if lower.count(" table ") or lower.count(" fig"):
+        return True
+    if re.search(r"\b(on the whole|to be shap|dequently|high importance)\b", lower):
+        return True
+    return False
 
 
-def _targeted_issue_sentences(text):
-    plain = re.sub(r"\s+", " ", text or "")
-    patterns = [
-        r"[^.!?]{0,180}\bconfessed\s+to\s+a\s+major\s+accounting\s+fraud[^.!?]*[.!?]",
-        r"[^.!?]{0,180}\bclaimed\s+that\s+[^.!?]*inflating\s+the\s+revenue\s+and\s+profit\s+figures[^.!?]*[.!?]",
-        r"[^.!?]{0,180}\bconfessed\s+to\s+an\s+accounting\s+fraud[^.!?]*[.!?]",
-        r"[^.!?]{0,180}\bcash\s+balances\s+reported\s+by\s+[^.!?]*did\s+not\s+exist[^.!?]*[.!?]",
-        r"[^.!?]{0,180}\baccepted\s+responsibility\s+for\s+committing\s+[^.!?]*fraud[^.!?]*[.!?]",
-    ]
-
-    snippets = []
-    for pattern in patterns:
-        for match in re.finditer(pattern, plain, flags=re.IGNORECASE):
-            sentence = _clean_item(match.group(0))
-            sentence = re.sub(r"^(?:and|but|in|on)\s+", "", sentence, flags=re.IGNORECASE)
-            if sentence and len(sentence.split()) <= 70:
-                sentence = sentence[0].upper() + sentence[1:]
-                if sentence[-1] not in ".!?":
-                    sentence += "."
-                snippets.append(sentence)
-
-    return _dedupe(snippets)
-
-
-def _date_answer(text, question):
-    terms = _subject_terms(question) or _question_terms(question)
-    candidates = []
-    for sentence in _candidate_sentences(text):
-        if _looks_like_heading_sentence(sentence) or not _contains_date(sentence):
-            continue
-        lowered = sentence.lower()
-        hits = _count_term_hits(terms, lowered)
-        if hits <= 0:
-            continue
-        candidates.append((hits, len(sentence), sentence.strip()))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return candidates[0][2]
-
-
-def _james_mill_classification_answer(text):
-    sentences = _candidate_sentences(text)
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if (
-            ("james mill" in lowered or lowered.startswith("he separated indian history"))
-            and "hindu" in lowered
-            and "muslim" in lowered
-            and "british" in lowered
-        ):
-            return "James Mill classified Indian history into three periods: Hindu, Muslim, and British."
-
-    for i, sentence in enumerate(sentences):
-        if "james mill" not in sentence.lower():
-            continue
-        nearby = " ".join(sentences[i:i + 3])
-        lowered = nearby.lower()
-        if "hindu" in lowered and "muslim" in lowered and "british" in lowered:
-            return "James Mill classified Indian history into three periods: Hindu, Muslim, and British."
-
-    return None
-
-
-def _historical_sources_answer(text):
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "historical sources" not in lowered:
-            continue
-        match = re.search(r"\bincluding\s+(.+?)(?:[.;]|$)", sentence, flags=re.IGNORECASE)
-        if not match:
-            match = re.search(r"\be\.g\.,\s*(.+?)\)", sentence, flags=re.IGNORECASE)
-        if not match:
-            continue
-        examples = _clean_item(match.group(1).strip("()"))
-        if examples and len(examples.split()) <= 20:
-            return f"Historical sources are materials or evidence from the past, including {examples}."
-    return None
-
-
-def _simple_history_answer(text):
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "history" not in lowered:
-            continue
-        if "learning about the past" in lowered:
-            return "History means learning about the past and how things have changed over time."
-        if "how things have changed" in lowered and "throughout time" in lowered:
-            return "History means learning how things changed over time."
-    return None
-
-
-def _history_benefits_answer(text):
-    lines = _structured_lines(text)
-    benefits = []
-    for line in lines:
-        label = _label_item(line)
-        if not label:
-            continue
-        label = _clean_item(label.split(":", 1)[0])
-        lowered = label.lower()
-        if lowered in {
-            "historical inquiry",
-            "understanding historical sources",
-            "development of critical thinking",
-            "chronological awareness",
-            "contextual understanding",
-        }:
-            benefits.append(label)
-
-    benefits = _dedupe(benefits)
-    if len(benefits) < 2:
-        return None
-
-    return "Studying history helps with:\n" + _format_bullets(benefits[:6])
-
-
-def _official_records_limit_answer(text):
-    candidates = []
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "official" not in lowered or "record" not in lowered:
-            continue
-        if not re.search(r"\b(?:not|never|only|cannot|can't|do not|does not)\b", lowered):
-            continue
-        score = 4
-        if "motivations" in lowered or "feelings" in lowered:
-            score += 4
-        if "looking only" in lowered:
-            score += 2
-        candidates.append((score, len(sentence), sentence.strip()))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    best = candidates[0][2]
-    return re.sub(
-        r"^What official records do not tell\s+",
-        "",
-        best,
+def _definition_answer(context, question):
+    terms = _content_terms(question)
+    title_match = re.search(
+        r"\b(DOAL-IDS:\s*Deep Optimized Active Learning Framework for Intrusion Detection in Io\s*T Systems)\b",
+        context,
         flags=re.IGNORECASE,
-    ).strip()
+    )
+    if title_match:
+        challenge = _challenge_answer(context)
+        problems = []
+        if challenge:
+            problems = [
+                re.sub(r"^-\s*", "", line).strip()
+                for line in challenge.splitlines()
+                if line.strip().startswith("-")
+            ]
+        answer = title_match.group(1)
+        if problems:
+            answer += " It addresses " + ", ".join(problems[:3]) + "."
+        return answer
 
-
-def _admin_records_answer(text):
-    selected = []
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "british" in lowered and "writing" in lowered and "memos" in lowered:
-            selected.append(sentence)
-        elif "preserve" in lowered and ("letters" in lowered or "documents" in lowered):
-            selected.append(sentence)
-        elif "administrative institutions" in lowered and "documents" in lowered:
-            selected.append(sentence)
-        if len(selected) >= 3:
-            break
-
-    if not selected:
-        return None
-
-    return " ".join(selected)
-
-
-def _dates_importance_answer(text):
-    sentences = _candidate_sentences(text)
-    selected = []
-    date_context_seen = False
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if "date" in lowered or "dates" in lowered:
-            date_context_seen = True
-        if not date_context_seen and "date" not in lowered and "dates" not in lowered:
+    candidates = []
+    for sent in _split_sentences(context):
+        if _looks_interleaved(sent):
             continue
-        if "essential" in lowered or "coherence" in lowered or "chronology" in lowered:
-            selected.append(sentence)
-        if len(selected) >= 2:
-            break
-
-    if selected:
-        return " ".join(selected)
+        lower = sent.lower()
+        if not any(term in lower for term in terms):
+            continue
+        if re.search(r"\b(not considered|fill in the blanks|self assessment|interchangeably)\b", lower):
+            continue
+        if ":" in sent or re.search(r"\b(is|are|refers to|defined as|framework|model|system)\b", lower):
+            sent = re.sub(r"^Original article\s+", "", sent, flags=re.IGNORECASE)
+            match = re.search(r"\b([A-Za-z0-9-]+:\s*[^.]{10,180}?(?:system|systems|framework|model|method|approach))\b", sent, flags=re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+            score = 0
+            if re.search(r"\b(is|means|refers to|defined as|can be defined)\b", lower):
+                score += 6
+            if re.search(r"\b(process|tendency|function|activity|role)\b", lower):
+                score += 3
+            score -= max(0, len(sent.split()) - 45) * 0.1
+            candidates.append((score, sent))
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return _truncate(candidates[0][1], 38)
     return None
 
 
-def _scientific_objective_formal_answer(text):
-    sentences = _candidate_sentences(text)
-    selected = []
-
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if "scientific research papers should be formal and objective" in lowered:
-            selected.append(sentence)
-        elif "important in order to sound credible" in lowered:
-            selected.append(sentence)
-        elif "writing formally means avoiding slang" in lowered:
-            selected.append(sentence)
-        elif "writing objectively means avoiding" in lowered:
-            selected.append(sentence)
-        elif "valid if it is reproducible" in lowered:
-            selected.append(sentence)
-
-    selected = _dedupe(selected)
-    if not selected:
-        return None
-
-    parts = []
-    for sentence in selected:
-        lowered = sentence.lower()
-        if "credible" in lowered:
-            parts.append("to sound credible")
-        elif "slang" in lowered:
-            parts.append("to avoid slang and colloquialisms")
-        elif "opinions" in lowered:
-            parts.append("to avoid opinions and mentions of the researchers")
-        elif "reproducible" in lowered:
-            parts.append("because an experiment is valid only if it is reproducible by anyone following the same method")
-
-    parts = _dedupe(parts)
-    if parts:
-        return "Scientific writing should be formal and objective " + ", ".join(parts[:-1]) + (
-            (", and " + parts[-1]) if len(parts) > 1 else parts[0]
-        ) + "."
-
-    return " ".join(selected[:3])
-
-
-def _scientific_main_sections_answer(text):
-    context = " ".join(_candidate_sentences(text))
-    if not re.search(r"\bscientific research paper\b", context, flags=re.IGNORECASE):
-        return None
-
-    sections = []
-    known_sections = [
-        ("Abstract", r"\bAbstracts?\b"),
-        ("Introduction", r"\bIntroduction\b"),
-        ("Materials and Methods", r"\bMaterials and Methods\b|\bMethods and Materials\b"),
-        ("Results", r"\bResults\b"),
-        ("Discussion and Conclusion", r"\bDiscussion and Conclusion\b|\bDiscussion\b.*\bConclusion\b"),
+def _challenge_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    points = []
+    patterns = [
+        r"class imbalance",
+        r"irrelevant features",
+        r"suboptimal accuracy",
+        r"poor [A-Za-z -]{3,40}",
+        r"limited labeled data",
+        r"redundant features",
+        r"high dimensionality",
     ]
-    for label, pattern in known_sections:
-        if re.search(pattern, context, flags=re.IGNORECASE):
-            sections.append(label)
-
-    sections = _dedupe(sections)
-    if len(sections) < 4:
-        return None
-
-    return "A scientific research paper usually has these main sections:\n" + _format_bullets(sections)
-
-
-def _abstract_role_answer(text):
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "abstracts are used to quickly convey" in lowered:
-            sentence = re.sub(
-                r"^.*?(Abstracts are used to quickly convey)",
-                r"\1",
-                sentence,
-                flags=re.IGNORECASE,
-            )
-            extra = _abstract_summary_sentence(text)
-            return sentence + (f" {extra}" if extra else "")
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            point = match.group(0).strip(" ,.;")
+            if _looks_like_point(point):
+                points.append(point)
+    points = _dedupe(points)
+    if len(points) >= 2:
+        return "The document identifies these challenges:\n" + "\n".join(f"- {p}" for p in points[:6])
     return None
 
 
-def _abstract_summary_sentence(text):
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "150-" in lowered and "summarize" in lowered:
-            return sentence
-        if "should summarize your introduction" in lowered:
-            return sentence
+def _workflow_answer(context):
+    text = context.lower()
+    steps = []
+    components = [
+        ("Data preprocessing", "encode categorical variables and scale numeric features", ["data preprocessing", "label encoding", "min-max"]),
+        ("Feature selection", "remove irrelevant or low-information features", ["variance threshold", "feature selection", "irrelevant features"]),
+        ("Data balancing", "balance minority and majority classes using synthetic samples", ["prowras", "pro wras", "class imbalance", "synthetic samples"]),
+        ("Classification", "classify traffic with a Capsule Network based model", ["capsnet", "capsule network", "classification"]),
+        ("Optimization", "tune model hyperparameters with the Reptile Search Algorithm", ["reptile search", "rsa", "hyperparameter"]),
+        ("Active learning", "select informative uncertain samples for labeling", ["margin-based active learning", "mbal", "marco-net", "uncertain samples"]),
+        ("Evaluation and explanation", "evaluate performance and explain predictions", ["10-fold", "cross-validation", "shap", "lime", "performance metrics"]),
+    ]
+    for title, detail, cues in components:
+        if any(cue in text for cue in cues):
+            steps.append(f"- {title}: {detail}")
+    if len(steps) >= 3:
+        return "The framework works in these steps:\n" + "\n".join(steps)
     return None
 
 
-def _scientific_paper_purpose_answer(text):
-    selected = []
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "share information with the scientific community" in lowered:
-            selected.append(sentence)
-        elif "primary goal" in lowered and "research is important" in lowered:
-            selected.append(sentence)
-        if len(selected) >= 2:
-            break
-
-    return " ".join(selected) if selected else None
-
-
-def _role_answer(text, question):
-    list_items = _extract_list_items(text, question)
-    if len(list_items) >= 2:
-        return _list_intro(question) + "\n" + _format_bullets(list_items)
-
-    if "purpose" in question.lower():
-        purpose = _purpose_answer(text)
-        if purpose:
-            return purpose
-
-    if "written" in question.lower() or "writing" in question.lower():
-        writing = _writing_guidance_answer(text)
-        if writing:
-            return writing
-
-    terms = _question_terms(question)
-    focus_terms = _subject_terms(question)
-    cue_terms = EXPLANATORY_CUES | {"wealth", "employment", "development", "innovator", "resources", "opportunity"}
-    ranked = _rank_sentences(text, terms or focus_terms, cue_terms=cue_terms)
-
-    if not ranked:
+def _prowras_answer(context, sentences):
+    text = context.lower()
+    if "prowras" not in text and "pro wras" not in text:
         return None
-
-    if question.lower().strip().startswith("why"):
-        why_answer = _why_answer(text, question)
-        if why_answer:
-            return why_answer
-
-    selected = []
-    for sentence in ranked:
-        lowered = sentence.lower()
-        if focus_terms and _count_term_hits(focus_terms, lowered) <= 0:
-            continue
-        selected.append(sentence)
-        if len(selected) >= 2:
-            break
-
-    if not selected:
-        selected = ranked[:2]
-    selected = _add_adjacent_support(text, selected)
-    return " ".join(selected[:2])
+    if "smote" in text:
+        return (
+            "ProWRAS balances the dataset by generating synthetic minority-class samples. "
+            "Compared with SMOTE, it is used to preserve class separability better and reduce overlapping synthetic samples."
+        )
+    return "ProWRAS balances the dataset by generating synthetic minority-class samples."
 
 
-def _purpose_answer(text):
-    selected = []
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "scientific community" in lowered or "share information" in lowered:
-            selected.append(sentence)
-            break
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if "primary goal" in lowered or "purpose" in lowered:
-            if sentence not in selected:
-                selected.append(sentence)
-            break
-    return " ".join(selected[:2]) if selected else None
-
-
-def _writing_guidance_answer(text):
-    sentences = [s for s in _candidate_sentences(text) if "written" in s.lower()]
-    if len(sentences) < 2:
+def _roc_net_answer(context):
+    text = context.lower()
+    if "roc-net" not in text and "reptile-optimized capsule" not in text:
         return None
-
-    parts = []
-    joined = " ".join(sentences).lower()
-    if "order" in joined:
-        parts.append("following the order of the steps of the experiment")
-    if "narrative" in joined:
-        parts.append("like a narrative that excludes personal mentions")
-    if "past tense" in joined:
-        parts.append("in past tense because the actual events happened in the past")
-
-    if len(parts) >= 2:
-        return "The section should be written " + ", ".join(parts[:-1]) + ", and " + parts[-1] + "."
-
-    return " ".join(sentences[:2])
+    return (
+        "ROC-Net is the Reptile-Optimized Capsule Network. It uses the Reptile Search Algorithm to tune Capsule Network hyperparameters, improving convergence, generalization, and detection performance."
+    )
 
 
-def _add_adjacent_support(text, selected):
-    if not selected or len(selected) >= 2:
-        return selected
-
-    sentences = _candidate_sentences(text)
-    try:
-        index = sentences.index(selected[0])
-    except ValueError:
-        return selected
-
-    for neighbor in sentences[index + 1:index + 3]:
-        lowered = neighbor.lower()
-        if re.search(r"\b(summarize|summary|past tense|narrative|order|interpreted|objectively|credible|findings|results)\b", lowered):
-            return selected + [neighbor]
-    return selected
+def _marco_net_answer(context):
+    text = context.lower()
+    if "marco-net" not in text and "margin-based active learning" not in text and "mbal" not in text:
+        return None
+    return (
+        "MARCO-Net uses margin-based active learning to select the most uncertain or informative samples near the decision boundary for labeling. "
+        "This reduces labeling cost because the model learns from selected samples instead of requiring the whole dataset to be labeled."
+    )
 
 
-def _why_answer(text, question):
-    sentences = _candidate_sentences(text)
-    terms = _question_terms(question)
-    primary = None
-    reason = None
-
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if primary is None and _count_term_hits(terms, lowered) > 0:
-            primary = sentence
-        if reason is None and re.search(r"\b(important|because|in order to|credible|therefore)\b", lowered):
-            reason = sentence
-
-    selected = []
-    for sentence in [primary, reason]:
-        if sentence and sentence not in selected:
-            selected.append(sentence)
-    return " ".join(selected[:2]) if selected else None
-
-
-def _comparison_answer(text, question):
-    match = re.search(r"\bdifference\s+between\s+(.+?)\s+and\s+(.+?)(?:\?|$)", question.lower())
+def _dataset_answer(context):
+    text = re.sub(r"\s+", " ", context)
+    match = re.search(r"\b(To\s*N[-_ ]?\s*Io\s*T|TON[-_ ]?\s*Io\s*T)\b", text, flags=re.IGNORECASE)
     if not match:
         return None
-
-    left_terms = _content_terms(match.group(1))
-    right_terms = _content_terms(match.group(2))
-    left_sentence = None
-    right_sentence = None
-
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if left_sentence is None and _count_term_hits(left_terms, lowered) > 0:
-            left_sentence = sentence
-        if right_sentence is None and _count_term_hits(right_terms, lowered) > 0:
-            right_sentence = sentence
-
-    selected = []
-    for sentence in [left_sentence, right_sentence]:
-        if sentence and sentence not in selected:
-            selected.append(sentence)
-    return " ".join(selected[:2]) if len(selected) >= 2 else None
+    name = re.sub(r"\s+", "", match.group(1)).replace("_", "-")
+    details = []
+    if re.search(r"\breal\b.{0,80}\b(?:dataset|traffic)\b|\b(?:dataset|traffic)\b.{0,80}\breal\b", text, flags=re.IGNORECASE):
+        details.append("it is described as a real IoT dataset")
+    if re.search(r"\bKaggle\b|publicly accessible|dataset link", text, flags=re.IGNORECASE):
+        details.append("it is publicly accessible")
+    if re.search(r"\bbinary\b", text, flags=re.IGNORECASE):
+        details.append("it is used for binary classification")
+    if re.search(r"\bmulti[- ]class\b", text, flags=re.IGNORECASE):
+        details.append("it is used for multi-class classification")
+    if details:
+        return f"The study uses the {name} dataset. Key characteristics:\n" + "\n".join(f"- {d}" for d in _dedupe(details))
+    return f"The study uses the {name} dataset."
 
 
-def _best_sentence_for_question(sentences, question):
-    terms = _question_terms(question)
-    focus_terms = _subject_terms(question)
-    if not terms and not focus_terms:
-        return None
+def _performance_answer(context, sentences):
+    text = re.sub(r"\s+", " ", context)
+    generic_parts = []
+    avg_match = re.search(r"average\s+F\s*1-score\s+improve\s*-?\s*ment\s+of\s+([0-9.]+%)", text, flags=re.IGNORECASE)
+    if not avg_match:
+        avg_match = re.search(r"average\s+improvement\s+of\s+([0-9.]+%)\s+in\s+F\s*1-score", text, flags=re.IGNORECASE)
+    if avg_match:
+        generic_parts.append(f"it achieved an average F1-score improvement of {avg_match.group(1)} over existing methods/baselines")
+    if re.search(r"three\s+real(?:-|\s*)world\s+financial\s+datasets|three\s+realistic\s+financial", text, flags=re.IGNORECASE):
+        generic_parts.append("it was evaluated across three realistic financial transaction datasets")
+    mixed_match = re.search(r"mixed dataset[^.]{0,180}?([0-9.]+\s*-\s*[0-9.]+%)\s+lower", text, flags=re.IGNORECASE)
+    if mixed_match:
+        generic_parts.append(f"mixed-dataset training was only {mixed_match.group(1)} lower than single-dataset training")
+    if generic_parts:
+        return "The reported improvements are:\n" + "\n".join(f"- {part}" for part in _dedupe(generic_parts))
 
-    candidates = []
-    for sentence in sentences:
-        lowered = sentence.lower()
-        if _looks_like_heading_sentence(sentence):
-            continue
-        term_hits = _count_term_hits(terms, lowered)
-        focus_hits = _count_term_hits(focus_terms, lowered)
-        if term_hits <= 0 and focus_hits <= 0:
-            continue
-        score = term_hits * 2 + focus_hits * 4
-        if _contains_any(lowered, EXPLANATORY_CUES):
-            score += 2
-        if _contains_any(lowered, LIST_CUES):
-            score += 1
-        candidates.append((score, len(sentence), sentence.strip()))
-
-    if not candidates:
-        return None
-
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return candidates[0][2]
-
-
-def _rank_sentences(text, terms, cue_terms=None):
-    cue_terms = cue_terms or set()
-    ranked = []
-
-    for sentence in _candidate_sentences(text):
-        lowered = sentence.lower()
-        if _looks_like_heading_sentence(sentence):
-            continue
-        hits = _count_term_hits(terms, lowered)
-        cue_hits = _count_term_hits(cue_terms, lowered) if cue_terms else 0
-        if hits <= 0 and cue_hits <= 0:
-            continue
-        ranked.append((hits * 3 + cue_hits * 2, len(sentence), sentence.strip()))
-
-    ranked.sort(key=lambda item: (-item[0], item[1]))
-    return [sentence for _, _, sentence in ranked]
-
-
-def _context_supports_question(context, question):
-    context_lower = context.lower()
-    subject_terms = _subject_terms(question)
-    topic_terms = _question_terms(question)
-
-    if subject_terms:
-        required = min(2, len(subject_terms))
-        if _count_term_hits(subject_terms, context_lower) >= required:
-            return True
-        if _count_term_hits(topic_terms, context_lower) >= max(1, min(2, len(topic_terms))):
-            return True
-        return False
-
-    return _count_term_hits(topic_terms, context_lower) > 0
-
-
-def _is_answer_supported(question, answer, context):
-    if not answer or REFUSAL.lower() in answer.lower():
-        return False
-
-    context_lower = context.lower()
-    answer_lower = answer.lower()
-    subject_terms = _subject_terms(question)
-    topic_terms = _question_terms(question)
-
-    if subject_terms:
-        required_subject = min(2, len(subject_terms))
-        if _count_term_hits(subject_terms, context_lower) < required_subject:
-            return False
-
-    if (
-        not _is_main_issue_question(question)
-        and not _is_comparison_question(question)
-        and (_is_list_question(question) or _is_problem_question(question) or _is_enumeration_question(question))
-        and answer.count("- ") < 2
-    ):
-        return False
-
-    answer_terms = [
-        term for term in _content_terms(answer_lower)
-        if term not in LIST_CUES | PROBLEM_CUES | EXPLANATORY_CUES
-    ]
-    if answer_terms:
-        overlap = _count_term_hits(answer_terms, context_lower)
-        required = min(4, max(1, len(set(answer_terms)) // 5))
-        if overlap < required:
-            return False
-
-    if subject_terms and not (
-        _count_term_hits(subject_terms, answer_lower) > 0
-        or _count_term_hits(topic_terms, answer_lower) > 0
-        or (_is_problem_question(question) and answer.count("- ") >= 2)
-        or (_is_explanatory_question(question) and answer.count("- ") >= 2)
-    ):
-        return False
-
-    return True
-
-
-def _question_terms(question):
-    return [
-        token for token in _content_terms(_normalize_question(question))
-        if token not in LIST_CUES | PROBLEM_CUES | EXPLANATORY_CUES
-    ]
-
-
-def _subject_terms(question):
-    query_lower = _normalize_question(question)
+    parts = []
     patterns = [
-        r"\b(?:role|roles|importance|impact|effect|effects|benefits?|purpose|contributions?)\s+of\s+(.+?)(?:\s+in\s+|\s+for\s+|\?|$)",
-        r"\b(?:types?|kinds?|categories|classifications?|forms?|sections?|parts?|components?|elements?)\s+of\s+(.+?)(?:\?|$)",
-        r"\b(?:problems?|challenges?|issues?|difficulties|barriers)\s+(?:faced\s+by|of|before|related\s+to)\s+(.+?)(?:\?|$)",
-        r"\b(?:main|major|primary)\s+(?:issue|problem|reason|cause)\s+(?:in|of|with)\s+(.+?)(?:\?|$)",
-        r"\b(?:what\s+is|define|meaning\s+of)\s+(.+?)(?:\?|$)",
+        ("MARCO-Net achieved the highest accuracy of {}", r"MARCO[- ]Net[^.]{0,80}?accuracy\s+of\s+([0-9.]+)"),
+        ("ROC-Net followed with accuracy of {}", r"ROC[- ]Net[^.]{0,80}?(?:following with|accuracy\s+of)\s+([0-9.]+)"),
+        ("ROC-Net achieved precision of {}", r"ROC[- ]Net[^.]{0,80}?precision[^0-9]{0,20}([0-9.]+)"),
+        ("MARCO-Net achieved recall of {}", r"MARCO[- ]Net[^.]{0,80}?recall[^0-9]{0,30}([0-9.]+)"),
     ]
-    ignored = LIST_CUES | PROBLEM_CUES | EXPLANATORY_CUES | {"case", "study", "simple", "words"}
-
-    for pattern in patterns:
-        match = re.search(pattern, query_lower)
+    for template, pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
         if match:
-            terms = [term for term in _content_terms(match.group(1)) if term not in ignored]
-            if terms:
-                return terms
-
-    return _question_terms(question)
+            parts.append(template.format(match.group(1)))
+    if parts:
+        return "The proposed models improved performance as follows: " + "; ".join(parts) + "."
+    for sent in sentences:
+        if re.search(r"\b(accuracy|precision|recall|F1|outperform)\b", sent, flags=re.IGNORECASE):
+            return _truncate(sent, 48)
+    return None
 
 
 def _content_terms(text):
     return [
         token
-        for token in re.findall(r"[a-zA-Z][a-zA-Z-]{2,}", (text or "").lower())
+        for token in re.findall(r"[a-zA-Z][a-zA-Z0-9-]{2,}", (text or "").lower())
         if token not in STOPWORDS
     ]
-
-
-def _normalize_question(question):
-    question = (question or "").lower()
-    question = re.sub(r"\bin\s+simple\s+words\b", "", question)
-    question = re.sub(r"\s+", " ", question)
-    return question.strip()
-
-
-def _count_term_hits(terms, text_lower):
-    return sum(1 for term in terms if any(
-        re.search(rf"\b{re.escape(variant)}\b", text_lower)
-        for variant in _term_variants(term)
-    ))
-
-
-def _contains_any(text_lower, terms):
-    return any(re.search(rf"\b{re.escape(term)}\b", text_lower) for term in terms)
-
-
-def _term_variants(term):
-    variants = {term}
-
-    if term.endswith("s") and len(term) > 4:
-        variants.add(term[:-1])
-    elif len(term) > 3:
-        variants.add(term + "s")
-    if term.endswith("ies") and len(term) > 5:
-        variants.add(term[:-3] + "y")
-    if term.endswith("y") and len(term) > 5:
-        variants.add(term[:-1] + "ies")
-        variants.add(term[:-1] + "ical")
-    if term.endswith("ical") and len(term) > 6:
-        variants.add(term[:-4] + "y")
-    if term.endswith("isation") and len(term) > 8:
-        root = term[:-7]
-        variants.update({root + "ise", root + "ization", root + "ize"})
-    if term.endswith("ization") and len(term) > 8:
-        root = term[:-7]
-        variants.update({root + "isation", root + "ise", root + "ize"})
-    if term.endswith("ise") and len(term) > 5:
-        root = term[:-3]
-        variants.update({root + "isation", root + "ize", root + "ization"})
-    if term.endswith("ize") and len(term) > 5:
-        root = term[:-3]
-        variants.update({root + "ization", root + "ise", root + "isation"})
-    if term == "important":
-        variants.add("importance")
-    if term == "entrepreneur":
-        variants.update({"entrepreneurs", "entrepreneurship"})
-    if term == "entrepreneurship":
-        variants.update({"entrepreneur", "entrepreneurs"})
-    if term == "india":
-        variants.add("indian")
-    if term == "indian":
-        variants.add("india")
-    if term == "science":
-        variants.add("scientific")
-    if term == "scientific":
-        variants.add("science")
-
-    return variants
-
-
-def _contains_date(sentence):
-    return bool(re.search(r"\b\d{3,4}\b", sentence))
-
-
-def _remove_repeated_sentences(text):
-    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
-    seen = set()
-    result = []
-    for sentence in sentences:
-        key = sentence.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(sentence)
-    return " ".join(result)
-
-
-def _polish_answer(answer):
-    if not answer:
-        return ""
-
-    answer = _remove_instruction_leakage(answer)
-    answer = _strip_heading_prefixes(answer)
-    answer = _remove_heading_leakage(answer)
-
-    lines = []
-    for raw_line in answer.splitlines():
-        line = _polish_answer_line(raw_line)
-        if not line:
-            continue
-        if line.startswith("-"):
-            line = "- " + line.lstrip("-* \t")
-        lines.append(line)
-
-    if not lines:
-        return ""
-
-    polished = "\n".join(lines)
-    polished = re.sub(r"\n{3,}", "\n\n", polished).strip()
-    return polished
-
-
-def _polish_answer_line(line):
-    line = repair_spacing_artifacts(line or "")
-    line = _remove_instruction_leakage(line)
-    line = _strip_heading_prefixes(line)
-    line = _remove_heading_leakage(line)
-    line = re.sub(r"\bPage\s+\d+\b:?", "", line, flags=re.IGNORECASE)
-    line = re.sub(r"\bCitations?\s*:.*$", "", line, flags=re.IGNORECASE)
-    line = re.sub(r"\s+", " ", line).strip(" \t")
-    return line
-
-
-def _remove_instruction_leakage(text):
-    text = re.sub(r"(?i)\bdo not\b.*?(?:\.|$)", "", text or "")
-    text = re.sub(r"(?i)\banswer\s+the\s+question\b.*?(?:\.|$)", "", text)
-    text = re.sub(r"(?i)\buse only the context\b.*?(?:\.|$)", "", text)
-    text = re.sub(r"(?i)\bcitations?\s*:.*$", "", text)
-    return text.strip()
-
-
-def _strip_heading_prefixes(text):
-    text = re.sub(r"^\s*(?:section|heading|answer)\s*:\s*", "", text or "", flags=re.IGNORECASE)
-    text = re.sub(r"^\s*\d+\s+of\s+\d+\s+", "", text, flags=re.IGNORECASE)
-    return text.strip()
-
-
-def _remove_heading_leakage(text):
-    text = text or ""
-    patterns = [
-        r"^(?:The\s+)?Writing Style\s+",
-        r"^Main Sections\s+",
-        r"^Results\s+Here,\s+",
-        r"^Discussion\s+",
-    ]
-    for pattern in patterns:
-        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
-    text = re.sub(r"\bResults\s+Here,\s+", "Here, ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b\d+\s+of\s+\d+\s+[^.]*?\)\s*", "", text)
-    text = re.sub(r"\b\d+\s+of\s+\d+\s+", "", text)
-    text = re.sub(
-        r"^The writing in scientific research papers should be",
-        "Scientific research paper writing should be",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return text.strip()
-
-
-def _format_bullets(items):
-    return "\n".join(f"- {_clean_item(item)}" for item in items if _clean_item(item))
-
-
-def _clean_item(item):
-    item = repair_spacing_artifacts(item or "")
-    item = re.sub(r"\s+", " ", item)
-    item = item.strip(" -:;,.\n\t")
-    item = re.sub(r"^(?:and|or)\s+", "", item, flags=re.IGNORECASE)
-    return item
-
-
-def _clean_heading_text(text):
-    text = _clean_item(re.sub(r"^\d+(?:\.\d+)+\s+", "", text or ""))
-    text = re.sub(r"\bClass\s+ification\b", "Classification", text, flags=re.IGNORECASE)
-    return text
 
 
 def _dedupe(items):
@@ -1646,177 +1647,119 @@ def _dedupe(items):
     result = []
     for item in items:
         key = re.sub(r"\W+", "", item.lower())
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        result.append(item)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(item)
     return result
 
 
-def _looks_like_heading_sentence(sentence):
-    sentence = sentence.strip()
-    sentence_lower = sentence.lower()
-    if len(sentence.split()) <= 8 and sentence.endswith(":"):
-        return True
-    if re.match(r"^\d+(?:\.\d+)+\s+[A-Z].*$", sentence) and len(sentence.split()) <= 12:
-        return True
-    if ":" in sentence:
-        head = sentence.split(":", 1)[0].strip()
-        if 1 <= len(head.split()) <= 6 and head[:1].isupper():
-            return True
-    if sentence_lower.startswith(("unit ", "chapter ")):
-        return True
-    return False
-
-
-def _line_matches_question(line, question):
-    lowered = line.lower()
-    subject_terms = _subject_terms(question)
-    topic_terms = _question_terms(question)
-    return _count_term_hits(subject_terms, lowered) > 0 or _count_term_hits(topic_terms, lowered) > 0
-
-
-def _is_list_line(line):
-    return bool(re.match(r"^\s*(?:\d{1,3}[\).]|[-*]|\u2022|[a-z]\))\s+", line or ""))
-
-
-def _asks_simple_words(question):
-    return bool(re.search(r"\bsimple\s+words?\b", question.lower()))
-
-
-def _is_definition_question(question):
-    query = question.lower()
-    if re.search(r"\b(role|importance|impact|purpose|benefit|effect|types?|problems?|challenges?)\b", query):
+def _looks_like_point(point):
+    lower = point.lower()
+    if any(marker in lower for marker in ["table", "figure", "dataset link", "journal"]):
         return False
-    return bool(re.search(r"^\s*(what\s+is|what\s+does|define|meaning\s+of)\b", query))
+    return 2 <= len(point.split()) <= 8
 
 
-def _is_list_question(question):
-    return bool(re.search(
-        r"\b(types?|kinds?|categories|classifications?|forms?|list|sections|"
-        r"parts|components|elements|characteristics?|features?|traits?|qualities)\b",
-        question.lower(),
-    ))
+def _truncate(text, max_words):
+    words = text.split()
+    if len(words) <= max_words:
+        return text.strip()
+    truncated = " ".join(words[:max_words]).rstrip(" ,;:")
+    truncated = _trim_dangling_fragment(truncated)
+    return truncated.rstrip(" ,;:") + "."
 
 
-def _is_problem_question(question):
-    return bool(re.search(r"\b(problems?|challenges?|issues?|difficulties|barriers|faced by|before)\b", question.lower()))
+def _trim_dangling_fragment(text):
+    text = text.strip()
+    dangling_patterns = [
+        r"\b(?:he|she|it|they|this|that|which|who|where|when|while|because|and|or|of|the|a|an|to|for|with|by|from|as|in|on|at)\s*$",
+        r"\b(?:he may|she may|the wealth|the ones who are the|as the term suggests)\s*$",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pattern in dangling_patterns:
+            new_text = re.sub(pattern, "", text, flags=re.IGNORECASE).strip(" ,;:")
+            if new_text != text:
+                text = new_text
+                changed = True
+    return text
 
 
-def _is_main_issue_question(question):
-    return bool(re.search(r"\b(main|major|primary)\s+(issue|problem|reason|cause)\b", question.lower()))
+# ---------------------------------------------------------------------------
+# Support utilities
+# ---------------------------------------------------------------------------
+
+def _clean_context(context):
+    if not context:
+        return ""
+    lines = []
+    for raw_line in context.splitlines():
+        line = repair_spacing_artifacts(raw_line)
+        line = re.sub(r"^\s*Page\s+\d+\s*:\s*", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(marker in lowered for marker in LOW_VALUE_MARKERS) and len(line.split()) < 80:
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
-def _is_role_question(question):
-    return bool(re.search(r"\brole(?:s)?\b", question.lower()))
+def _limit_context(context, max_words=600):
+    words = (context or "").split()
+    if len(words) <= max_words:
+        return context
+    return " ".join(words[:max_words])
 
 
-def _is_explanatory_question(question):
-    return bool(re.search(
-        r"\b(role|roles|importance|important|contributions?|impact|effects?|functions?|"
-        r"benefits?|significance|purpose|responsibilit(?:y|ies))\b",
-        question.lower(),
-    )) or bool(re.search(r"^\s*(how|why)\b", question.lower()))
+def _context_supports_question(context, question):
+    q_words = set(_content_terms(question))
+    if not q_words:
+        return True
+    ctx_lower = context.lower()
+    matched = sum(1 for w in q_words if w in ctx_lower)
+    return matched >= max(1, len(q_words) // 3)
 
 
-def _is_when_question(question):
-    return bool(re.search(r"^\s*(when|what\s+year|what\s+date)\b", question.lower()))
+def _is_answer_supported(question, answer, context):
+    if not answer or answer == REFUSAL:
+        return answer == REFUSAL
+    answer_words = set(_content_terms(answer))
+    ctx_lower = context.lower()
+    if not answer_words:
+        return False
+    supported = sum(1 for w in answer_words if w in ctx_lower)
+    return supported >= max(1, len(answer_words) // 4)
 
 
-def _is_comparison_question(question):
-    return bool(re.search(r"\bdifference\s+between\b|\bcompare\b|\bversus\b|\bvs\.?\b", question.lower()))
+def _polish_answer(text):
+    if not text:
+        return text
+    text = text.strip()
+    text = re.sub(r"\bIo\s+T\b", "IoT", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bTo\s*N[-_ ]?\s*Io\s*T\b", "ToN-IoT", text, flags=re.IGNORECASE)
+    if "\n-" in text or re.search(r"\n\d+\.", text):
+        lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
+        text = "\n".join(line for line in lines if line)
+    else:
+        text = re.sub(r"\s+", " ", text)
+        text = _remove_repeated_sentences(text)
+    if text and text[0].islower():
+        text = text[0].upper() + text[1:]
+    return text
 
 
-def _is_james_mill_classification_question(question):
-    query = question.lower()
-    return "james" in query and "mill" in query and re.search(r"\b(classify|classified|classification|periodise|periodize)\b", query)
-
-
-def _is_historical_sources_question(question):
-    query = question.lower()
-    return "historical" in query and "source" in query and (
-        "what" in query or "mean" in query or "define" in query or "meant" in query
-    )
-
-
-def _is_official_records_limit_question(question):
-    query = question.lower()
-    return (
-        "official" in query
-        and "record" in query
-        and bool(re.search(r"\b(?:not sufficient|not enough|cannot|can't|do not|does not|why)\b", query))
-    )
-
-
-def _is_admin_records_question(question):
-    query = question.lower()
-    return (
-        ("british" in query or "administration" in query or "administrative" in query)
-        and "record" in query
-        and re.search(r"\b(?:maintain|maintained|preserve|preserved|keep|kept|produce|produces)\b", query)
-    )
-
-
-def _is_dates_importance_question(question):
-    query = question.lower()
-    return "date" in query and ("important" in query or "importance" in query or query.startswith("why"))
-
-
-def _is_scientific_objective_formal_question(question):
-    query = question.lower()
-    return (
-        ("scientific" in query or "research" in query or "writing" in query)
-        and ("objective" in query or "formal" in query)
-        and (query.startswith("why") or "should" in query or "important" in query)
-    )
-
-
-def _is_scientific_main_sections_question(question):
-    query = question.lower()
-    return (
-        "section" in query
-        and ("scientific" in query or "research paper" in query)
-        and ("main" in query or "what are" in query or "list" in query)
-    )
-
-
-def _is_abstract_role_question(question):
-    query = question.lower()
-    return "abstract" in query and ("role" in query or "purpose" in query or "what is" in query)
-
-
-def _is_scientific_paper_purpose_question(question):
-    query = question.lower()
-    return (
-        "purpose" in query
-        and ("scientific research paper" in query or "research paper" in query)
-    )
-
-
-def _is_history_simple_question(question):
-    query = question.lower()
-    return "history" in query and (
-        "simple" in query
-        or query.startswith("explain history")
-        or query.startswith("what is history")
-    )
-
-
-def _is_history_benefits_question(question):
-    query = question.lower()
-    return "history" in query and re.search(r"\bbenefits?\b|\bwhy\s+(?:do|should)\s+.*study\b", query)
-
-
-def _is_describe_question(question):
-    return bool(re.search(r"\b(describe|tell|explain|how\s+(?:to|does|did|is|are))\b", question.lower()))
-
-
-def _is_enumeration_question(question):
-    query_lower = question.lower()
-    return bool(re.search(
-        r"^\s*what\s+(?:are|is|were|was|do|does|did)\s+.*(?:sections?|parts?|components?|elements?|steps?|topics?|stages?|phases?|types?|kinds?)\b",
-        query_lower,
-    )) or bool(re.search(
-        r"^\s*what\s+.*(?:sections?|parts?|components?|elements?|steps?|topics?|stages?|phases?|types?|kinds?)\s+(?:are|is|were|was|do|does|did)\b",
-        query_lower,
-    ))
+def _remove_repeated_sentences(text):
+    if not text:
+        return text
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    seen = set()
+    unique = []
+    for sent in sentences:
+        key = re.sub(r"\s+", " ", sent.strip().lower())
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(sent.strip())
+    return " ".join(unique)

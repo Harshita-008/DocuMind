@@ -1,6 +1,6 @@
 import re
 
-from app.config import CHUNK_OVERLAP, CHUNK_SIZE
+from app.config import CHUNK_OVERLAP, CHUNK_SIZE, CONTEXT_WINDOW_SIZE
 
 
 MIN_CHUNK_WORDS = 18
@@ -15,16 +15,17 @@ LIST_ITEM_RE = re.compile(r"^\s*(?:\d{1,3}[\).]|[-*]|\u2022|[a-z]\))\s+")
 LABEL_ITEM_RE = re.compile(r"^\s*[A-Z][A-Za-z0-9'\"/&(). -]{2,72}:\s+\S+")
 LOW_VALUE_LINE_RE = re.compile(
     r"^\s*(?:self assessment|review questions?|further readings?|keywords?|"
-    r"objectives?|contents?|chapter overview|source:|task|caution|did u know\?)\b",
+    r"objectives?|contents?|chapter overview|source:|task|caution|did u know\?|"
+    r"learning outcomes?|key terms?|summary questions?|check your understanding)\b",
     re.IGNORECASE,
 )
 
 BOILERPLATE_PHRASES = {
-    "- how, when, and where is dates",
     "here we have provided",
     "to better comprehend the ideas",
     "students should review the chapter",
-    "benefits of cbse class",
+    "students should review",
+    "please note that",
 }
 
 
@@ -275,4 +276,38 @@ def chunk_text(docs, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         if current_units:
             flush(keep_overlap=False)
 
+    return _attach_context_windows(chunks)
+
+
+def _attach_context_windows(chunks, radius=CONTEXT_WINDOW_SIZE):
+    if radius <= 0:
+        for chunk in chunks:
+            chunk["window_text"] = chunk["text"]
+        return chunks
+
+    for index, chunk in enumerate(chunks):
+        start = max(0, index - radius)
+        end = min(len(chunks), index + radius + 1)
+        window_parts = []
+        for neighbor in chunks[start:end]:
+            if abs(int(neighbor.get("page", 0)) - int(chunk.get("page", 0))) > 1:
+                continue
+            text = neighbor.get("text", "")
+            if text:
+                window_parts.append(text)
+        chunk["window_text"] = _dedupe_window_lines("\n".join(window_parts))
+
     return chunks
+
+
+def _dedupe_window_lines(text):
+    seen = set()
+    lines = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        key = re.sub(r"\W+", "", line.lower())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        lines.append(line)
+    return "\n".join(lines).strip()

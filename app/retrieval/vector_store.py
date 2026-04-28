@@ -32,6 +32,7 @@ class VectorStore:
                 "page": int(c["page"]),
                 "chunk_index": int(c.get("chunk_index", i)),
                 "section_title": str(c.get("section_title") or ""),
+                "window_text": str(c.get("window_text") or c.get("text") or ""),
             }
             for i, c in enumerate(chunks)
         ]

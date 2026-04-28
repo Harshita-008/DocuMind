@@ -76,7 +76,7 @@ async def chat(query: str):
             return {"answer": REFUSAL, "citations": []}
 
         context = "\n\n".join([
-            f"Page {chunk['page']}:\n{chunk['text']}"
+            f"Page {chunk['page']}:\n{chunk.get('window_text') or chunk['text']}"
             for chunk in filtered
         ])
         if not context.strip():
@@ -96,6 +96,31 @@ async def chat(query: str):
     except Exception as exc:
         print("ERROR:", str(exc))
         return {"answer": "An error occurred", "citations": []}
+
+
+@app.get("/debug/retrieve")
+async def debug_retrieve(query: str):
+    if not query or not query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+    if retriever is None:
+        raise HTTPException(status_code=400, detail="Please upload a PDF first.")
+
+    results = retriever.retrieve(query)
+    filtered = filter_relevant_chunks(results, query=query, max_chunks=MAX_CONTEXT_CHUNKS + 2)
+    return {
+        "query": query,
+        "chunks": [
+            {
+                "page": chunk.get("page"),
+                "chunk_index": chunk.get("chunk_index"),
+                "score": chunk.get("score"),
+                "guardrail_score": chunk.get("guardrail_score"),
+                "text": (chunk.get("text") or "")[:500],
+                "window_text": (chunk.get("window_text") or "")[:800],
+            }
+            for chunk in filtered
+        ],
+    }
 
 
 STOPWORDS = {
@@ -133,7 +158,8 @@ def _select_citations(answer, query, chunks):
         if page <= 0:
             continue
 
-        chunk_terms = set(_content_terms(chunk.get("text", "")))
+        evidence_text = f"{chunk.get('text', '')}\n{chunk.get('window_text', '')}"
+        chunk_terms = set(_content_terms(evidence_text))
         answer_overlap_terms = (
             distinctive_answer_terms.intersection(chunk_terms)
             if has_distinctive_overlap
@@ -164,36 +190,31 @@ def _select_citations(answer, query, chunks):
 
 
 def _anchored_citation_pages(query, chunks):
-    query_lower = (query or "").lower()
-    patterns = []
+    """Find pages whose text shares the most content terms with the query.
 
-    if "main sections" in query_lower and "scientific" in query_lower:
-        patterns = [r"\bmain sections\b"]
-    elif "abstract" in query_lower:
-        patterns = [r"\babstracts are used\b"]
-    elif ("objective" in query_lower or "formal" in query_lower) and "writing" in query_lower:
-        patterns = [r"\bformal and objective\b", r"\bwriting objectively\b"]
-    elif "materials" in query_lower and "methods" in query_lower:
-        patterns = [
-            r"\bmaterials and methods\b.{0,120}\bsection explains how\b",
-            r"\bfollowing the order of the steps\b",
-            r"\bpast tense\b",
-        ]
-    elif "purpose" in query_lower and "research paper" in query_lower:
-        patterns = [r"\bshare information with the scientific community\b", r"\bprimary goal\b"]
-
-    if not patterns:
+    Returns at most 2 candidate pages with high query-term overlap, or an
+    empty list when no chunk clears the threshold (citation falls back to the
+    general scoring path in _select_citations).
+    """
+    query_terms = set(_content_terms(query))
+    if not query_terms or not chunks:
         return []
 
-    pages = []
+    page_hits = {}
     for chunk in chunks:
-        text = (chunk.get("text") or "").lower()
-        if any(re.search(pattern, text) for pattern in patterns):
-            page = int(chunk.get("page", 0) or 0)
-            if page > 0 and page not in pages:
-                pages.append(page)
+        text = f"{chunk.get('text', '')}\n{chunk.get('window_text', '')}".lower()
+        chunk_terms = set(_content_terms(text))
+        overlap = len(query_terms & chunk_terms)
+        page = int(chunk.get("page", 0) or 0)
+        if page > 0 and overlap > 0:
+            page_hits[page] = max(page_hits.get(page, 0), overlap)
 
-    return pages
+    if not page_hits:
+        return []
+
+    threshold = max(page_hits.values()) * 0.6
+    strong = [p for p, hits in page_hits.items() if hits >= threshold]
+    return sorted(strong)[:2]
 
 
 def _content_terms(text):
