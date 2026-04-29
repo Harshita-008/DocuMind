@@ -3,6 +3,7 @@
 DocuMind is a document question-answering application that lets users upload a PDF and ask natural-language questions about its contents. It uses a retrieval-augmented generation pipeline with PDF extraction, structure-aware chunking, hybrid retrieval, guardrails, and grounded answer generation with page citations.
 
 Deployed link: https://documind-ysjx.onrender.com
+
 Demo Link: https://drive.google.com/drive/folders/1Ia0iNkUnB3VJSVd9X-XZzffRIVoPdTeD?usp=sharing
 
 ## Overview
