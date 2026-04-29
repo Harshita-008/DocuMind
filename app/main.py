@@ -17,6 +17,12 @@ from app.retrieval.vector_store import VectorStore
 DB = None
 retriever = None
 
+FRONTEND_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("FRONTEND_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
 app = FastAPI(title="DocuMind")
 
 app.add_middleware(
@@ -24,6 +30,7 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        *FRONTEND_ORIGINS,
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -32,6 +39,11 @@ app.add_middleware(
 
 DB = VectorStore()
 retriever = Retriever()
+
+
+@app.get("/")
+async def health_check():
+    return {"status": "ok", "service": "DocuMind"}
 
 
 @app.post("/upload")
