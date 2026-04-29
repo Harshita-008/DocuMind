@@ -111,7 +111,7 @@ def _openai_answer(context, question):
 
     try:
         from openai import OpenAI
-        from app.agent.promt import SYSTEM_PROMPT
+        from app.agent.prompt import SYSTEM_PROMPT
     except Exception:
         return None
 

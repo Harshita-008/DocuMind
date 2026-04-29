@@ -102,7 +102,7 @@ DocuMind/
 |   |-- agent/
 |   |   |-- generator.py        # Grounded answer generation
 |   |   |-- guardrails.py       # Context filtering and relevance checks
-|   |   `-- promt.py            # System prompt configuration
+|   |   `-- prompt.py            # System prompt configuration
 |   |-- evaluation/
 |   |   |-- evaluator.py        # Testability runner for predefined queries
 |   |   `-- test_cases.json     # Valid and invalid test cases
@@ -296,7 +296,65 @@ Invalid queries:
 3. Write a Python program.
    Expected: Refusal.
 
-You can also run the local test runner:
+## Test Instructions
+
+1. Start the backend:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+2. Start the frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+3. Open the application in the browser:
+
+```text
+http://localhost:5173
+```
+
+4. Upload the sample PDF:
+
+```text
+sample/sample.pdf
+```
+
+5. Test valid queries:
+
+```text
+What is entrepreneurship?
+What are types of entrepreneurship?
+What are the problems faced by entrepreneurs in India?
+Why is entrepreneurship important for economic development?
+What was the main issue in the Satyam case study?
+```
+
+Expected:
+
+- Answers should be correct.
+- Answers must include citations.
+- Answers should be grounded in the document.
+
+6. Test invalid queries:
+
+```text
+What is machine learning?
+Who is Elon Musk?
+Write a Python program
+```
+
+Expected:
+
+```text
+I cannot answer this question from the provided document.
+```
+
+7. Optional: run the automated test runner:
 
 ```bash
 python -m app.evaluation.evaluator
