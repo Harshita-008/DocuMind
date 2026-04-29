@@ -1,33 +1,36 @@
 # DocuMind
 
-DocuMind is a document question-answering application that lets users upload a PDF and ask natural-language questions about its contents. It uses a retrieval-augmented generation pipeline with PDF extraction, structure-aware chunking, vector search, keyword reranking, guardrails, and grounded answer generation with page citations.
+DocuMind is a document question-answering application that lets users upload a PDF and ask natural-language questions about its contents. It uses a retrieval-augmented generation pipeline with PDF extraction, structure-aware chunking, hybrid retrieval, guardrails, and grounded answer generation with page citations.
 
 Deployed link: `PASTE_YOUR_DEPLOYED_LINK_HERE`
 
 ## Overview
 
-DocuMind is designed for PDFs such as textbooks, research papers, reports, and technical documents. Instead of sending the whole PDF to a model, it extracts the document text, indexes meaningful chunks, retrieves only the most relevant evidence for each question, and generates a concise answer using that evidence.
+DocuMind is built for PDFs such as textbooks, research papers, reports, and technical documents. Instead of sending the whole document to a model, it extracts text, indexes meaningful chunks, retrieves the most relevant evidence, and generates concise answers from that evidence.
 
-The project focuses on reliable document-grounded QA:
+The system focuses on:
 
-- Answers should come only from the uploaded PDF.
-- Irrelevant questions should be refused.
-- Citations should point to the pages used as evidence.
-- Retrieval should work across different PDF styles, not just one fixed document.
+- Correct answers grounded in the uploaded PDF.
+- Clear refusal when the answer is not present in the document.
+- Page citations for retrieved evidence.
+- Reliable behavior across different PDF formats and writing styles.
+
+The system was tested using predefined valid and invalid queries to ensure correctness, grounding, and refusal behavior.
 
 ## Features
 
-- PDF upload and indexing through a FastAPI backend.
-- Text extraction using PyMuPDF with fallback support through `pypdf`.
-- Structure-aware chunking for headings, lists, paragraphs, and page metadata.
-- ChromaDB vector storage with Sentence Transformers embeddings.
-- Hybrid retrieval using semantic search, keyword matching, section-aware scoring, and reranking.
-- Guardrails to filter noisy chunks, references, boilerplate, and unrelated context.
-- Grounded answer generation with strict refusal for unsupported questions.
-- Page-level citations for answers.
-- Debug retrieval endpoint for inspecting selected chunks.
-- React + Vite frontend for uploading PDFs and chatting with documents.
-- Evaluation script with valid and invalid test cases.
+- Upload and process PDF documents.
+- Extract text using PyMuPDF with fallback support through `pypdf`.
+- Clean and repair common PDF extraction artifacts.
+- Split documents using structure-aware chunking for paragraphs, headings, and lists.
+- Store embeddings and metadata in ChromaDB.
+- Retrieve context using vector search, keyword scoring, section cues, and reranking.
+- Filter irrelevant or noisy chunks with guardrails.
+- Generate concise, document-grounded answers.
+- Refuse unsupported questions instead of hallucinating.
+- Return page-level citations.
+- Inspect retrieval behavior through a debug endpoint.
+- Use a React + Vite frontend for document upload and chat.
 
 ## System Architecture
 
@@ -40,29 +43,29 @@ React Frontend
   v
 FastAPI Backend
   |
-  +--> PDF Loader
-  |      - extracts text page by page
-  |      - repairs common spacing/artifact issues
+  +-- PDF Loader
+  |   +-- extracts text page by page
+  |   +-- repairs common spacing and extraction issues
   |
-  +--> Chunker
-  |      - creates sentence/section-aware chunks
-  |      - stores page, chunk index, section title, and context windows
+  +-- Chunker
+  |   +-- creates section-aware chunks
+  |   +-- stores page, chunk index, section title, and context windows
   |
-  +--> Embedder + Vector Store
-  |      - generates embeddings with Sentence Transformers
-  |      - stores chunks in ChromaDB
+  +-- Embedder and Vector Store
+  |   +-- generates embeddings with Sentence Transformers
+  |   +-- stores chunks and metadata in ChromaDB
   |
-  +--> Retriever
-  |      - combines vector search and keyword ranking
-  |      - reranks chunks using query type, section cues, and phrase matches
+  +-- Retriever
+  |   +-- combines vector search and keyword ranking
+  |   +-- reranks chunks using query type, phrase matches, and section cues
   |
-  +--> Guardrails
-  |      - removes unrelated, noisy, low-value, or unsupported chunks
+  +-- Guardrails
+  |   +-- removes unrelated, noisy, low-value, or unsupported chunks
   |
-  +--> Generator
-         - creates a grounded answer from retrieved context
-         - refuses questions not supported by the document
-         - returns answer with citations
+  +-- Generator
+      +-- answers using only retrieved context
+      +-- refuses unsupported questions
+      +-- returns answer with citations
 ```
 
 ## Tech Stack
@@ -85,24 +88,63 @@ Frontend:
 - Vite
 - JavaScript
 
-Evaluation and utilities:
+Testing and utilities:
 
-- Custom evaluator script
+- Predefined valid and invalid queries
 - JSON test cases
 - Retrieval debug endpoint
 
+## Folder Structure
+
+```text
+DocuMind/
+|-- app/
+|   |-- agent/
+|   |   |-- generator.py        # Grounded answer generation
+|   |   |-- guardrails.py       # Context filtering and relevance checks
+|   |   `-- promt.py            # System prompt configuration
+|   |-- evaluation/
+|   |   |-- evaluator.py        # Testability runner for predefined queries
+|   |   `-- test_cases.json     # Valid and invalid test cases
+|   |-- ingestion/
+|   |   |-- chunker.py          # Structure-aware chunking
+|   |   |-- embedder.py         # Embedding model wrapper
+|   |   `-- pdf_loader.py       # PDF text extraction
+|   |-- retrieval/
+|   |   |-- retriever.py        # Hybrid retrieval and reranking
+|   |   `-- vector_store.py     # ChromaDB storage layer
+|   |-- utils/
+|   |   |-- helpers.py
+|   |   `-- logger.py
+|   |-- config.py               # Environment and pipeline settings
+|   `-- main.py                 # FastAPI application
+|-- data/
+|   |-- sample.pdf              # Sample PDF used for testing
+|   `-- db/                     # Local ChromaDB files, ignored by Git
+|-- frontend/
+|   |-- src/                    # React frontend source
+|   |-- index.html
+|   |-- package.json
+|   `-- vite.config.js
+|-- sample/                     # Sample documents for testing/demo
+|-- notebooks/
+|-- requirements.txt
+|-- test_pipeline.py
+`-- README.md
+```
+
 ## How It Works
 
-1. A user uploads a PDF.
+1. The user uploads a PDF.
 2. The backend saves the PDF in `data/`.
 3. The PDF loader extracts text page by page.
-4. The chunker cleans and splits text into meaningful chunks while preserving page numbers and context windows.
+4. The chunker cleans and splits the text into meaningful chunks.
 5. The embedder converts chunks into vector embeddings.
-6. ChromaDB stores the chunks, metadata, and embeddings.
-7. When the user asks a question, the retriever searches for candidate chunks.
-8. The retriever reranks candidates using semantic similarity, keyword overlap, section cues, query type, and phrase matches.
-9. Guardrails filter unsupported or noisy context.
-10. The generator creates a concise answer using only the selected context.
+6. ChromaDB stores chunks, embeddings, and metadata.
+7. For each question, the retriever selects candidate chunks.
+8. The reranker prioritizes chunks using semantic similarity, keyword overlap, query type, and section cues.
+9. Guardrails remove unrelated or noisy context.
+10. The generator answers only from the selected context.
 11. The API returns the answer and page citations.
 
 ## Setup Instructions
@@ -149,7 +191,7 @@ LLM_MODEL=google/flan-t5-base
 OPENAI_LLM_MODEL=gpt-4o-mini
 ```
 
-`OPENAI_API_KEY` is optional if you want to rely on the local fallback model, but OpenAI generation gives better answer quality.
+`OPENAI_API_KEY` is optional if you want to rely on the local fallback model, but OpenAI generation generally gives better answer quality.
 
 ### 5. Start the backend
 
@@ -186,27 +228,11 @@ http://localhost:5173
 
 1. Open the frontend in the browser.
 2. Upload a PDF document.
-3. Wait for the PDF to be processed and indexed.
+3. Wait for indexing to complete.
 4. Ask questions about the uploaded document.
-5. Read the generated answer and citations.
+5. Review the answer and page citations.
 
-Example questions:
-
-```text
-What is entrepreneurship?
-What are the main sections of a scientific research paper?
-What problem does the proposed framework solve?
-Which dataset is used in the study?
-What are the limitations mentioned in the document?
-```
-
-Unsupported question example:
-
-```text
-What is artificial intelligence?
-```
-
-If the uploaded PDF does not contain the answer, DocuMind should respond:
+Unsupported questions should return:
 
 ```text
 I cannot answer this question from the provided document.
@@ -232,86 +258,51 @@ Entrepreneurship can be classified by ownership into:
 Citations: Page 23
 ```
 
-## Evaluation
+## Testability
 
-The project includes an evaluator that indexes `data/sample.pdf` and runs valid and invalid test cases from `app/evaluation/test_cases.json`.
+The project includes a sample PDF and predefined valid and invalid queries to verify correctness, grounding, and refusal behavior.
 
-Run:
+Sample PDF:
+
+```text
+sample/sample.pdf
+```
+
+Valid queries:
+
+1. What is entrepreneurship?
+   Expected: Definition with citation.
+
+2. What are types of entrepreneurship?
+   Expected: List of types with citations.
+
+3. What are the problems faced by entrepreneurs in India?
+   Expected: Bullet points.
+
+4. Why is entrepreneurship important for economic development?
+   Expected: Bullet points.
+
+5. What was the main issue in the Satyam case study?
+   Expected: Critical thinking answer grounded in the document.
+
+Invalid queries:
+
+1. What is machine learning?
+   Expected: Refusal.
+
+2. Who is Elon Musk?
+   Expected: Refusal.
+
+3. Write a Python program.
+   Expected: Refusal.
+
+You can also run the local test runner:
 
 ```bash
 python -m app.evaluation.evaluator
 ```
 
-Latest evaluator result:
-
-```text
-Score: 8/8
-Accuracy: 100.00%
-```
-
-The evaluator checks:
-
-- whether valid document questions receive grounded answers
-- whether unsupported questions are refused
-- whether the retrieval and generation pipeline works after indexing
-
-## Limitations
-
-- PDF extraction quality depends on the structure of the source PDF.
-- Scanned image-only PDFs require OCR, which is not currently included.
-- Very complex tables, formulas, and multi-column layouts may still produce noisy text.
-- The current vector database stores one active indexed PDF at a time.
-- Some domain-specific answers may require stronger reranking or a more capable LLM.
-- Citations are page-level, not sentence-level.
-
-## Future Improvements
-
-- Add OCR support for scanned PDFs.
-- Support multiple PDFs and document collections.
-- Add cross-encoder reranking for stronger retrieval precision.
-- Improve table and figure extraction.
-- Add sentence-level citation grounding.
-- Add user authentication and document history.
-- Add deployment configuration for production hosting.
-- Add automated test coverage for retrieval, generation, and API endpoints.
-
-## Folder Structure
-
-```text
-DocuMind/
-├── app/
-│   ├── agent/
-│   │   ├── generator.py        # Grounded answer generation
-│   │   ├── guardrails.py       # Context filtering and relevance checks
-│   │   └── promt.py            # System prompt configuration
-│   ├── evaluation/
-│   │   ├── evaluator.py        # Evaluation runner
-│   │   └── test_cases.json     # Valid and invalid evaluation queries
-│   ├── ingestion/
-│   │   ├── chunker.py          # Structure-aware chunking
-│   │   ├── embedder.py         # Embedding model wrapper
-│   │   └── pdf_loader.py       # PDF text extraction
-│   ├── retrieval/
-│   │   ├── retriever.py        # Hybrid retrieval and reranking
-│   │   └── vector_store.py     # ChromaDB storage layer
-│   ├── utils/
-│   │   ├── helpers.py
-│   │   └── logger.py
-│   ├── config.py               # Environment and pipeline settings
-│   └── main.py                 # FastAPI application
-├── data/
-│   ├── sample.pdf              # Sample evaluation PDF
-│   └── db/                     # Local ChromaDB files, ignored by Git
-├── frontend/
-│   ├── src/                    # React frontend source
-│   ├── index.html
-│   ├── package.json
-│   └── vite.config.js
-├── notebooks/
-├── requirements.txt
-├── test_pipeline.py
-└── README.md
-```
+The purpose of this runner is to verify behavior on predefined queries, not to provide a full scoring or metrics dashboard.
 
 ## API Endpoints
 
@@ -332,6 +323,26 @@ Debug retrieval:
 ```text
 GET /debug/retrieve?query=your_question
 ```
+
+## Limitations
+
+- PDF extraction quality depends on the structure of the source PDF.
+- Scanned image-only PDFs require OCR, which is not currently included.
+- Very complex tables, formulas, and multi-column layouts may still produce noisy text.
+- The current vector database stores one active indexed PDF at a time.
+- Some domain-specific answers may require stronger reranking or a more capable LLM.
+- Citations are page-level, not sentence-level.
+
+## Future Improvements
+
+- Add OCR support for scanned PDFs.
+- Support multiple PDFs and document collections.
+- Add cross-encoder reranking for stronger retrieval precision.
+- Improve table and figure extraction.
+- Add sentence-level citation grounding.
+- Add user authentication and document history.
+- Add deployment configuration for production hosting.
+- Add automated tests for retrieval, generation, and API endpoints.
 
 ## Notes
 
