@@ -2,7 +2,7 @@ import hashlib
 import math
 import re
 
-from app.config import EMBEDDING_MODEL
+from app.config import EMBEDDING_MODEL, ENABLE_SENTENCE_TRANSFORMERS
 
 
 FALLBACK_DIM = 384
@@ -27,6 +27,9 @@ def get_embeddings(texts):
 
 def _get_sentence_transformer():
     global _model, _model_load_attempted
+
+    if not ENABLE_SENTENCE_TRANSFORMERS:
+        return None
 
     if _model is not None:
         return _model

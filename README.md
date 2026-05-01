@@ -189,11 +189,27 @@ Create a `.env` file in the project root:
 ```env
 OPENAI_API_KEY=your_openai_api_key
 EMBEDDING_MODEL=all-MiniLM-L6-v2
+ENABLE_SENTENCE_TRANSFORMERS=true
+EMBEDDING_BATCH_SIZE=32
+MAX_UPLOAD_MB=10
 LLM_MODEL=google/flan-t5-base
 OPENAI_LLM_MODEL=gpt-4o-mini
 ```
 
 `OPENAI_API_KEY` is optional if you want to rely on the local fallback model, but OpenAI generation generally gives better answer quality.
+
+For small Render backend instances, keep upload processing lightweight:
+
+```env
+FRONTEND_ORIGINS=https://documind-ysjx.onrender.com
+ENABLE_SENTENCE_TRANSFORMERS=false
+EMBEDDING_BATCH_SIZE=16
+MAX_UPLOAD_MB=10
+```
+
+If uploads still close the connection, check the Render backend logs during an
+upload. A restart or "out of memory" message means the instance needs a smaller
+PDF, lower `MAX_UPLOAD_MB`, or a larger Render plan.
 
 ### 5. Start the backend
 

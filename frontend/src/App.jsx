@@ -65,7 +65,14 @@ function App() {
       });
 
       if (!res.ok) {
-        throw new Error("Upload failed. Check backend and try again.");
+        let message = "Upload failed. Check backend and try again.";
+        try {
+          const data = await res.json();
+          message = data.detail || message;
+        } catch {
+          // Keep the generic message if the backend closed before returning JSON.
+        }
+        throw new Error(message);
       }
 
       await res.json();

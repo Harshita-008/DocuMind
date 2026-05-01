@@ -1,13 +1,13 @@
 import os
 import re
-import shutil
+import uuid
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.agent.generator import REFUSAL, generate_answer
 from app.agent.guardrails import filter_relevant_chunks
-from app.config import MAX_CONTEXT_CHUNKS
+from app.config import MAX_CONTEXT_CHUNKS, MAX_UPLOAD_BYTES, MAX_UPLOAD_MB
 from app.ingestion.chunker import chunk_text
 from app.ingestion.pdf_loader import load_pdf
 from app.retrieval.retriever import Retriever
@@ -51,19 +51,51 @@ async def upload_pdf(file: UploadFile = File(...)):
     global DB, retriever
 
     os.makedirs("data", exist_ok=True)
-    file_path = f"data/{file.filename}"
+    filename = os.path.basename(file.filename or "")
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF file.")
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    safe_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
+    file_path = os.path.join("data", f"{uuid.uuid4().hex}_{safe_name}")
 
-    docs = load_pdf(file_path)
-    chunks = chunk_text(docs)
-    if not chunks:
-        raise HTTPException(status_code=400, detail="No readable text could be extracted from this PDF.")
+    total_size = 0
+    try:
+        with open(file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_size += len(chunk)
+                if total_size > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"PDF is too large. Maximum upload size is {MAX_UPLOAD_MB} MB.",
+                    )
+                buffer.write(chunk)
 
-    DB = VectorStore(reset=True)
-    DB.add_documents(chunks)
-    retriever = Retriever()
+        docs = load_pdf(file_path)
+        chunks = chunk_text(docs)
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No readable text could be extracted from this PDF.")
+
+        DB = VectorStore(reset=True)
+        DB.add_documents(chunks)
+        retriever = Retriever()
+    except HTTPException:
+        raise
+    except MemoryError:
+        raise HTTPException(
+            status_code=507,
+            detail="The PDF needs more memory than this backend instance has. Try a smaller PDF or a larger Render plan.",
+        )
+    except Exception as exc:
+        print("UPLOAD ERROR:", repr(exc))
+        raise HTTPException(status_code=500, detail="PDF upload failed during processing.")
+    finally:
+        try:
+            await file.close()
+        except Exception:
+            pass
 
     return {
         "message": "PDF uploaded and processed successfully",

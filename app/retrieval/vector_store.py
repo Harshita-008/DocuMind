@@ -1,5 +1,6 @@
 import chromadb
 
+from app.config import EMBEDDING_BATCH_SIZE
 from app.ingestion.embedder import get_embeddings
 
 
@@ -41,14 +42,18 @@ class VectorStore:
             for i, c in enumerate(chunks)
         ]
 
-        embeddings = get_embeddings(texts)
+        batch_size = max(1, EMBEDDING_BATCH_SIZE)
+        for start in range(0, len(texts), batch_size):
+            end = start + batch_size
+            batch_texts = texts[start:end]
+            embeddings = get_embeddings(batch_texts)
 
-        self.collection.upsert(
-            documents=texts,
-            metadatas=metadatas,
-            ids=ids,
-            embeddings=embeddings
-        )
+            self.collection.upsert(
+                documents=batch_texts,
+                metadatas=metadatas[start:end],
+                ids=ids[start:end],
+                embeddings=embeddings
+            )
 
     def query(self, query_text, top_k=5):
         query_embedding = get_embeddings([query_text])[0]

@@ -9,6 +9,15 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 LLM_MODEL = os.getenv("LLM_MODEL", "google/flan-t5-base")
 OPENAI_LLM_MODEL = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
 
+ENABLE_SENTENCE_TRANSFORMERS = os.getenv(
+    "ENABLE_SENTENCE_TRANSFORMERS",
+    "false" if os.getenv("RENDER") else "true",
+).lower() in {"1", "true", "yes", "on"}
+
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
 # Chunk size in words. 350 words gives ~430 tokens — enough for coherent
 # paragraphs while keeping chunks focused for embedding.
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "350"))
